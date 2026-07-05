@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SDLC Analysis Platform – AI Orchestrated</title>
+  <link rel="stylesheet" href="/css/style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+</head>
+<body>
+
+<!-- ═══════════════ HEADER ═══════════════ -->
+<header class="header">
+  <div class="header-inner">
+    <div class="logo">
+      <span class="logo-icon">◈</span>
+      <span class="logo-text">SDLC<span class="logo-accent">·AI</span></span>
+    </div>
+    <nav class="nav-pills" id="navPills">
+      <span class="nav-pill active" data-view="input">Analyze</span>
+      <span class="nav-pill" data-view="results" id="navResults">Results</span>
+    </nav>
+    <div class="header-badge">
+      <span class="badge-dot"></span>
+      <span>Multi-Model Orchestration</span>
+    </div>
+  </div>
+</header>
+
+<!-- ═══════════════ HERO / INPUT VIEW ═══════════════ -->
+<main id="viewInput" class="view active">
+
+  <section class="hero">
+    <div class="hero-tag">SDLC Analysis Phase Automation</div>
+    <h1 class="hero-title">Requirements In,<br><em>Architecture Out.</em></h1>
+    <p class="hero-sub">Paste your client brief. Three specialized AI models orchestrate a full Software Requirements Specification, Feasibility Study, Risk Assessment, and ROI in under two minutes.</p>
+    <div class="model-pills">
+      <span class="mpill gemini">Gemini · Elicitation & Enhancement</span>
+      <span class="mpill minimax">MiniMax-M3 · Validation</span>
+      <span class="mpill nemotron">Nemotron-3-Super-120B-A12B · Feasibility, Risks & Cost</span>
+    </div>
+  </section>
+
+  <section class="input-section">
+    <div class="input-card">
+      <div class="input-label">Client Requirements Brief</div>
+      <textarea id="requirementsInput" class="req-textarea" placeholder="e.g. Develop an online food delivery application. Users can register and login. Restaurants can manage menus. Customers can place orders. Online payment. Live order tracking. Admin dashboard."></textarea>
+
+      <div class="input-footer">
+        <div class="sample-btns">
+          <button class="btn-sample" onclick="loadSample('food')">Food Delivery App</button>
+          <button class="btn-sample" onclick="loadSample('hospital')">Hospital Management</button>
+          <button class="btn-sample" onclick="loadSample('ecommerce')">E-Commerce Platform</button>
+          <button class="btn-sample" onclick="loadSample('fintech')">AI Wealth Manager</button>
+          <button class="btn-sample" onclick="loadSample('smarthome')">IoT Energy Dashboard</button>
+          <button class="btn-sample" onclick="loadSample('rideshare')">P2P Ride-Sharing</button>
+        </div>
+        <button class="btn-analyze" id="analyzeBtn" onclick="startAnalysis()">
+          <span class="btn-icon">▶</span>
+          Run Analysis
+        </button>
+      </div>
+    </div>
+  </section>
+
+  <!-- PROGRESS -->
+  <section class="progress-section" id="progressSection" style="display:none">
+    <div class="progress-card">
+      <div class="progress-header">
+        <span class="progress-label" id="progressLabel">Initializing…</span>
+        <span class="progress-model" id="progressModel"></span>
+        <span class="progress-pct" id="progressPct">0%</span>
+      </div>
+      <div class="progress-bar-track">
+        <div class="progress-bar-fill" id="progressBar"></div>
+      </div>
+      <div class="pipeline-steps" id="pipelineSteps">
+        <div class="ps active" data-step="1">Elicitation</div>
+        <div class="ps" data-step="2">Analysis</div>
+        <div class="ps" data-step="3">Validation</div>
+        <div class="ps" data-step="4">SRS</div>
+        <div class="ps" data-step="5">Feasibility</div>
+        <div class="ps" data-step="6">Risk</div>
+        <div class="ps" data-step="7">Cost</div>
+        <div class="ps" data-step="8">ROI</div>
+        <div class="ps" data-step="9">Dashboard</div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<!-- ═══════════════ RESULTS VIEW ═══════════════ -->
+<div id="viewResults" class="view">
+
+  <div class="results-layout">
+
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-title">Analysis Modules</div>
+      <nav class="sidebar-nav" id="sidebarNav">
+        <a class="snav-item active" data-tab="overview">◈ Overview</a>
+        <a class="snav-item" data-tab="orchestrator">◈ AI Orchestrator</a>
+        <a class="snav-item" data-tab="elicitation">① Elicitation</a>
+        <a class="snav-item" data-tab="analysis">② Analysis</a>
+        <a class="snav-item" data-tab="validation">③ Validation</a>
+        <a class="snav-item" data-tab="srs">④ SRS Document</a>
+        <a class="snav-item" data-tab="feasibility">⑤ Feasibility</a>
+        <a class="snav-item" data-tab="risk">⑥ Risk Analysis</a>
+        <a class="snav-item" data-tab="cost">⑦ Cost Estimation</a>
+        <a class="snav-item" data-tab="roi">⑧ ROI Evaluation</a>
+        <a class="snav-item" data-tab="raw">⑩ Raw Output</a>
+      </nav>
+      <button class="btn-pdf" id="exportPdfBtn" onclick="exportToPDF()">⤓ Export Report PDF</button>
+      <button class="btn-new" onclick="resetAnalysis()">+ New Analysis</button>
+    </aside>
+
+    <!-- Content -->
+    <section class="results-content" id="resultsContent">
+      <!-- Dynamically populated -->
+    </section>
+
+  </div>
+
+</div>
+
+<script src="/js/samples.js"></script>
+<script src="/js/render.js"></script>
+<script src="/js/app.js"></script>
+</body>
+</html>
