@@ -1,8 +1,117 @@
 // analysisPipeline.js
-// Orchestrates the real-time SDLC analysis pipeline using Server-Sent Events (SSE).
-// Each stage sends progress/module events via the provided `send` callback.
-
+const fs = require("fs");
+const path = require("path");
 const ai = require("./aiService");
+
+// ── Session Store (in-memory + disk, for Design Phase handoff) ────────────────
+const sessionStore = new Map();
+const SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+const SESSION_DIR = path.join(__dirname, "../../.sessions");
+
+function ensureSessionDir() {
+  if (!fs.existsSync(SESSION_DIR)) {
+    fs.mkdirSync(SESSION_DIR, { recursive: true });
+  }
+}
+
+function createSession(data) {
+  const id = `sess_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  const record = { id, data, createdAt: Date.now() };
+  sessionStore.set(id, record);
+  ensureSessionDir();
+  try {
+    fs.writeFileSync(path.join(SESSION_DIR, `${id}.json`), JSON.stringify(record));
+  } catch (e) {
+    console.warn("[analysisPipeline] Failed to persist session to disk:", e.message);
+  }
+  setTimeout(() => {
+    sessionStore.delete(id);
+    try { fs.unlinkSync(path.join(SESSION_DIR, `${id}.json`)); } catch {}
+  }, SESSION_TTL_MS);
+  return id;
+}
+
+function getSession(id) {
+  const cached = sessionStore.get(id);
+  if (cached) {
+    if (Date.now() - cached.createdAt > SESSION_TTL_MS) {
+      sessionStore.delete(id);
+      return null;
+    }
+    return cached.data;
+  }
+
+  const filePath = path.join(SESSION_DIR, `${id}.json`);
+  if (!fs.existsSync(filePath)) return null;
+
+  try {
+    const record = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    if (Date.now() - record.createdAt > SESSION_TTL_MS) {
+      fs.unlinkSync(filePath);
+      return null;
+    }
+    sessionStore.set(id, record);
+    return record.data;
+  } catch (e) {
+    console.warn("[analysisPipeline] Failed to load session from disk:", e.message);
+    return null;
+  }
+}
+
+function getSessionMeta(id) {
+  const data = getSession(id);
+  if (!data) return null;
+  const cached = sessionStore.get(id);
+  const createdAt = cached?.createdAt || Date.now();
+  return {
+    sessionId: id,
+    createdAt,
+    expiresAt: createdAt + SESSION_TTL_MS,
+    modules: Object.keys(data),
+  };
+}
+
+function buildAIDashboard(orchestratorOutput, extracted, analyzed, validated, cost) {
+  const metrics = orchestratorOutput?.modelMetrics || {};
+  const geminiBase = metrics.Gemini?.score || extracted?.modelScores?.requirementExtraction || 90;
+  const minimaxBase = metrics.MiniMax?.score || 88;
+  const nemotronBase = metrics.Nemotron?.score || 87;
+
+  const costScore = (estimate) => {
+    if (!estimate?.hours) return 85;
+    return Math.min(99, Math.round(75 + Math.min(estimate.hours / 8, 24)));
+  };
+
+  return {
+    scores: {
+      Gemini: {
+        requirementExtraction: geminiBase,
+        requirementValidation: Math.round((geminiBase + (validated?.modelScores?.requirementValidation || 88)) / 2),
+        feasibilityAnalysis: Math.round((geminiBase + (analyzed?.modelScores?.feasibilityAnalysis || 90)) / 2),
+        riskAnalysis: Math.round((geminiBase + 90) / 2),
+        costEstimation: costScore(cost?.geminiEstimate),
+        documentation: extracted?.modelScores?.documentation || Math.min(99, geminiBase + 2),
+      },
+      MiniMax: {
+        requirementExtraction: minimaxBase,
+        requirementValidation: validated?.modelScores?.requirementValidation || minimaxBase,
+        feasibilityAnalysis: Math.round((minimaxBase + 91) / 2),
+        riskAnalysis: Math.round((minimaxBase + 93) / 2),
+        costEstimation: costScore(cost?.minimaxEstimate),
+        documentation: Math.min(99, minimaxBase + 1),
+      },
+      Nemotron: {
+        requirementExtraction: nemotronBase,
+        requirementValidation: Math.round((nemotronBase + 90) / 2),
+        feasibilityAnalysis: analyzed?.modelScores?.feasibilityAnalysis || nemotronBase,
+        riskAnalysis: analyzed?.modelScores?.riskAnalysis || nemotronBase,
+        costEstimation: costScore(cost?.nemotronEstimate),
+        documentation: Math.min(99, nemotronBase + 3),
+      },
+    },
+    modelMetrics: metrics,
+  };
+}
 
 /**
  * Helper to send an SSE event.
@@ -146,7 +255,7 @@ async function buildDocumentation(extracted, analyzed, validated, send, orchestr
   emit(send, "module", { id: 6, name: "Risk Analysis", data: risks });
 
   // Cost Estimation
-  emit(send, "progress", { step: 7, label: "Estimating Cost", model: "Nemotron-3-Super", percent: 78 });
+  emit(send, "progress", { step: 7, label: "Estimating Cost", model: "Gemini + MiniMax + Nemotron", percent: 78 });
   const cost = await ai.costEstimation(extracted, analyzed);
   emit(send, "module", { id: 7, name: "Cost Estimation", data: cost });
 
@@ -158,38 +267,7 @@ async function buildDocumentation(extracted, analyzed, validated, send, orchestr
   // AI Dashboard Comparison
   emit(send, "progress", { step: 9, label: "Building AI Dashboard", model: "System", percent: 95 });
 
-  const geminiScore = orchestratorOutput?.modelMetrics?.Gemini?.score || extracted.modelScores?.requirementExtraction || 96;
-  const minimaxScore = orchestratorOutput?.modelMetrics?.MiniMax?.score || 92;
-  const nemotronScore = orchestratorOutput?.modelMetrics?.Nemotron?.score || 91;
-
-  const aiDashboard = {
-    scores: {
-      Gemini: {
-        requirementExtraction: geminiScore,
-        requirementValidation: 90,
-        feasibilityAnalysis: 91,
-        riskAnalysis: 92,
-        costEstimation: 90,
-        documentation: extracted.modelScores?.documentation || 97,
-      },
-      MiniMax: {
-        requirementExtraction: minimaxScore,
-        requirementValidation: validated.modelScores?.requirementValidation || 97,
-        feasibilityAnalysis: 92,
-        riskAnalysis: 94,
-        costEstimation: 91,
-        documentation: 93,
-      },
-      Nemotron: {
-        requirementExtraction: nemotronScore,
-        requirementValidation: 93,
-        feasibilityAnalysis: analyzed.modelScores?.feasibilityAnalysis || 97,
-        riskAnalysis: analyzed.modelScores?.riskAnalysis || 96,
-        costEstimation: analyzed.modelScores?.costEstimation || 97,
-        documentation: 94,
-      },
-    },
-  };
+  const aiDashboard = buildAIDashboard(orchestratorOutput, extracted, analyzed, validated, cost);
   emit(send, "module", { id: 9, name: "AI Comparison Dashboard", data: aiDashboard });
 
   // Generate comprehensive markdown report
@@ -226,8 +304,11 @@ async function runAnalysisPipeline(requirements, send) {
   const validated = await validateRequirements(extracted, analyzed, send);
   const artefacts = await buildDocumentation(extracted, analyzed, validated, send, orchestratorOutput);
   
-  // Signal completion to the client
-  emit(send, "complete", { modules: artefacts });
+  // Create session for Design Phase handoff
+  const sessionId = createSession(artefacts);
+
+  // Signal completion to the client (include sessionId for Design Phase)
+  emit(send, "complete", { modules: artefacts, sessionId });
   return artefacts;
 }
 
@@ -237,4 +318,7 @@ module.exports = {
   analyzeRequirements,
   validateRequirements,
   buildDocumentation,
+  getSession,
+  getSessionMeta,
+  createSession,
 };

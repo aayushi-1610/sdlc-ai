@@ -592,8 +592,30 @@ function renderOrchestrator(orchestrator) {
 </div>`;
 }
 
+function renderReport(reportMarkdown) {
+  if (!reportMarkdown) {
+    return `<div class="tab-pane" id="tab-report"><div class="pane-title">Analysis Report</div><p class="empty-state">Report not yet generated.</p></div>`;
+  }
+  const html = String(reportMarkdown)
+    .replace(/^### (.*$)/gim, '<h3>$1</h3>')
+    .replace(/^## (.*$)/gim, '<h2>$1</h2>')
+    .replace(/^# (.*$)/gim, '<h1>$1</h1>')
+    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\n\n/g, '</p><p>')
+    .replace(/\n/g, '<br>');
+  return `
+<div class="tab-pane" id="tab-report">
+  <div class="pane-title">Final Analysis Report</div>
+  <div class="pane-subtitle">Markdown report synthesized from all analysis modules</div>
+  <div class="card report-card">
+    <div class="report-body"><p>${html}</p></div>
+    <button class="btn-pdf" style="margin-top:16px" onclick="downloadReportMarkdown()">⤓ Download Report (.md)</button>
+  </div>
+</div>`;
+}
+
 // ------------------------------------------------------------
-// NEW: Render raw JSON output for debugging / full answer view
+// Render raw JSON output for debugging / full answer view
 function renderRaw(data) {
   const pretty = JSON.stringify(data, null, 2);
   return `

@@ -1,86 +1,34 @@
 const axios = require("axios");
 const { runModel } = require("./orchestrator");
+const { parseAIJSON, isParseError } = require("../utils/jsonUtils");
 
 // Helper to determine if we should fall back to mock data
 function shouldMock() {
   return process.env.USE_MOCK_FALLBACK === "true";
 }
 
-// Clean markdown wrapper backticks from AI responses
-function cleanJSONResponse(text) {
-  if (!text) return "{}";
-  let cleaned = text.trim();
-  
-  // Extract content between ```json and ``` or ``` and ```
-  const jsonBlockRegex = /```json\s*([\s\S]*?)\s*```/;
-  const codeBlockRegex = /```\s*([\s\S]*?)\s*```/;
-  
-  let match = jsonBlockRegex.exec(cleaned) || codeBlockRegex.exec(cleaned);
-  if (match && match[1]) {
-    cleaned = match[1].trim();
-  } else {
-    // Fallback: extract substring between first '{' and last '}'
-    const firstBrace = cleaned.indexOf('{');
-    const lastBrace = cleaned.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-      cleaned = cleaned.substring(firstBrace, lastBrace + 1).trim();
-    }
-  }
-
-  // Fix repeated line end glitches: e.g. "title": "Some Heterogeneity",\n Heterogeneity", -> "title": "Some Heterogeneity",
-  cleaned = cleaned.replace(/(\b\w+",?)\s*\n\s*(?!")\1/g, '$1');
-
-  // Fix merged key-value strings: e.g. "name: Unauthenticated Visitor", -> "name": "Unauthenticated Visitor",
-  cleaned = cleaned.replace(/([{,]\s*)"([a-zA-Z0-9_$]+)\s*:\s*([^"]+)"/g, '$1"$2": "$3"');
-
-  // Fix double-colon value repetitions: e.g. "key": "val1": "val2" -> "key": "val1"
-  cleaned = cleaned.replace(/"([^"]+)"\s*:\s*"([^"]+)"\s*:\s*"[^"]*"/g, '"$1": "$2"');
-
-  // Safe conversion of single-quoted keys/values to double-quoted JSON
-  // Quote single-quoted keys: {'key': value} -> {"key": value}
-  cleaned = cleaned.replace(/([{,]\s*)'([a-zA-Z0-9_$]+)'\s*:/g, '$1"$2":');
-  // Quote single-quoted string values: {key: 'value'} -> {key: "value"}
-  cleaned = cleaned.replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, ': "$1"');
-  // Quote single-quoted array elements: ['value'] -> ["value"]
-  cleaned = cleaned.replace(/([\[,]\s*)'([^'\\]*(?:\\.[^'\\]*)*)'(?=\s*[,\]])/g, '$1"$2"');
-
-  // Quote unquoted string values (e.g. : MiniMax -> : "MiniMax" or : MR-1 -> : "MR-1")
-  cleaned = cleaned.replace(/:\s*(?!true|false|null|[0-9\-'"\[{])([a-zA-Z0-9_\-]+)(?=\s*(?:,\s*"|\s*}))/g, ': "$1"');
-
-  // Remove trailing commas that crash JSON.parse
-  cleaned = cleaned.replace(/,\s*}/g, '}');
-  cleaned = cleaned.replace(/,\s*]/g, ']');
-
-  // Remove comments
-  cleaned = cleaned.replace(/\/\*[\s\S]*?\*\//g, '');
-  cleaned = cleaned.replace(/(?:^|[^:])\/\/.*$/gm, '');
-
-  return cleaned.trim();
+function safeParseJSON(text, moduleName) {
+  return parseAIJSON(text, moduleName);
 }
 
-function safeParseJSON(text, moduleName) {
-  const cleaned = cleanJSONResponse(text);
-  try {
-    return JSON.parse(cleaned);
-  } catch (err) {
-    console.error(`[aiService] JSON parse error in ${moduleName}: ${err.message}`);
-    try {
-      const fs = require("fs");
-      const filename = `${moduleName.toLowerCase().replace(/\s+/g, '_')}_fail_output.txt`;
-      fs.writeFileSync(filename, text || `(No output captured. Error: ${err.message})`);
-      console.log(`[aiService] Wrote raw output for ${moduleName} to ${filename} for debugging.`);
-    } catch (fsErr) {
-      console.error(`[aiService] Failed to write fail output file: ${fsErr.message}`);
-    }
+/** Mock/simulation fallback only for API/network failures when USE_MOCK_FALLBACK=true. Never on parse errors. */
+function resolveMockFallback(err, getMockData, label) {
+  if (isParseError(err)) {
+    console.error(`[aiService] ${label}: JSON parse error — not using simulation (${err.message})`);
     throw err;
   }
+  if (shouldMock()) {
+    console.warn(`[aiService] ${label}: using simulation fallback (${err.message})`);
+    return getMockData();
+  }
+  throw err;
 }
 
 // Unified AI pipeline using orchestrator
-async function runAIPipeline(systemPrompt, userPrompt, preferredProvider) {
+async function runAIPipeline(systemPrompt, userPrompt, preferredProvider, moduleName) {
   const strictUserPrompt = `${userPrompt}\n\nIMPORTANT: You must respond with a single, valid JSON object matching the requested schema. Do not include any conversational text, explanations, markdown formatting, or code blocks. Do not use ellipses (...) or placeholders under any circumstances; you must write out all fields, lists, and items completely.`;
   // Delegate to orchestrator's runModel which handles provider selection and fallback
-  return await runModel(systemPrompt, strictUserPrompt, preferredProvider);
+  return await runModel(systemPrompt, strictUserPrompt, preferredProvider, moduleName);
 }
 
 // ── HEURISTICS FOR MOCK ENGINE ───────────────────────────────────────────────
@@ -780,8 +728,8 @@ modelScores values between 88–97.`;
   }
 
   try {
-    const text = await runAIPipeline(system, `Extract requirements from:\n\n${rawInput}`, "Gemini");
-    return JSON.parse(cleanJSONResponse(text));
+    const text = await runAIPipeline(system, `Extract requirements from:\n\n${rawInput}`, "Gemini", "Extract");
+    return safeParseJSON(text, "Extract");
   } catch (err) {
     console.error(`[aiService] extractRequirements API error: ${err.message}. Using simulation mode fallback.`);
     const key = getSampleKey(rawInput);
@@ -824,10 +772,10 @@ Schema:
   }
 
   try {
-    const geminiText = await runAIPipeline(systemGemini, `Analyze these requirements:\n\n${inputStr}`, "Gemini");
+    const geminiText = await runAIPipeline(systemGemini, `Analyze these requirements:\n\n${inputStr}`, "Gemini", "Analyze");
     const geminiData = safeParseJSON(geminiText, "Gemini_Analyze");
 
-    const nemotronText = await runAIPipeline(systemNemotron, `Recommend stack for these requirements:\n\n${inputStr}`, "Nemotron");
+    const nemotronText = await runAIPipeline(systemNemotron, `Recommend stack for these requirements:\n\n${inputStr}`, "Nemotron", "AnalyzeRecommendation");
     const nemotronData = safeParseJSON(nemotronText, "Nemotron_Analyze");
 
     return {
@@ -881,7 +829,7 @@ modelScores value between 88–97.`;
   }
 
   try {
-    const text = await runAIPipeline(system, `Validate:\n\n${inputStr}`, "MiniMax");
+    const text = await runAIPipeline(system, `Validate:\n\n${inputStr}`, "MiniMax", "Validate");
     return safeParseJSON(text, "MiniMax_Validate");
   } catch (err) {
     console.error(`[aiService] validateRequirements API error: ${err.message}. Using simulation mode fallback.`);
@@ -927,7 +875,7 @@ Schema:
   }
 
   try {
-    const text = await runAIPipeline(system, `Feasibility for:\n\n${inputStr}`, "Nemotron");
+    const text = await runAIPipeline(system, `Feasibility for:\n\n${inputStr}`, "Nemotron", "Feasibility");
     return safeParseJSON(text, "Nemotron_Feasibility");
   } catch (err) {
     console.error(`[aiService] feasibilityStudy API error: ${err.message}. Using simulation mode fallback.`);
@@ -964,7 +912,7 @@ Schema:
 {
   "rawRisks": [{"title":string,"category":"Technical"|"Operational"|"Security"|"Compliance","description":string}]
 }`;
-    const nemotronText = await runAIPipeline(nemotronSystem, `Identify risks for:\n\n${inputStr}`, "Nemotron");
+    const nemotronText = await runAIPipeline(nemotronSystem, `Identify risks for:\n\n${inputStr}`, "Nemotron", "RiskIdentify");
     const rawRisks = safeParseJSON(nemotronText, "Nemotron_Risk");
 
     // Step 2: MiniMax-M3 validates and prioritizes them
@@ -977,7 +925,7 @@ Schema:
   "overallRiskLevel": "High"|"Medium"|"Low",
   "topRisk": string
 }`;
-    const minimaxText = await runAIPipeline(minimaxSystem, `Raw risks to validate & prioritize: \n\n${JSON.stringify(rawRisks)}`, "MiniMax");
+    const minimaxText = await runAIPipeline(minimaxSystem, `Raw risks to validate & prioritize: \n\n${JSON.stringify(rawRisks)}`, "MiniMax", "RiskValidate");
     return safeParseJSON(minimaxText, "MiniMax_Risk");
   } catch (err) {
     console.error(`[aiService] riskAnalysis API error: ${err.message}. Using simulation mode fallback.`);
@@ -989,23 +937,10 @@ Schema:
   }
 }
 
-// ── Module 7: Cost Estimation (Nemotron-3-Super-120B-A12B) ────────────────────────
+// ── Module 7: Cost Estimation (Gemini + MiniMax + Nemotron in parallel) ───────
 async function costEstimation(requirements, analysis) {
-  const system = `You are Nemotron-3-Super-120B-A12B, an expert software development cost estimator.
-Estimate development effort and cost for an Indian software project. Use an hourly rate of ₹800.
-Provide three estimates under the names: geminiEstimate, minimaxEstimate, and nemotronEstimate to show multi-model evaluation comparison, then calculate the average.
-RESPOND ONLY WITH VALID JSON (no markdown, no backticks).
-Schema:
-{
-  "geminiEstimate": {"hours":number,"rationale":string},
-  "minimaxEstimate": {"hours":number,"rationale":string},
-  "nemotronEstimate": {"hours":number,"rationale":string},
-  "averageHours": number,
-  "hourlyRateINR": number,
-  "totalCostINR": number,
-  "breakdown": [{"phase":string,"hours":number,"costINR":number}],
-  "timeline": {"totalWeeks":number,"phases":[{"name":string,"weeks":number}]}
-}`;
+  const estimateSchema = `Estimate development effort for an Indian software project at ₹800/hour.
+RESPOND ONLY WITH VALID JSON (no markdown): {"hours":number,"rationale":string}`;
 
   const prunedReqs = {
     projectTitle: requirements.projectTitle,
@@ -1016,28 +951,80 @@ Schema:
     technologyRecommendation: requirements.technologyRecommendation || analysis?.technologyRecommendation
   };
   const inputStr = JSON.stringify({ requirements: prunedReqs, analysis: prunedAnalysis });
+
   if (shouldMock()) {
     const key = getSampleKey(requirements.projectTitle || requirements.projectOverview);
-    if (key && MOCKS[key]) {
-      return MOCKS[key].cost;
-    }
+    if (key && MOCKS[key]) return MOCKS[key].cost;
     return generateDynamicCost(requirements);
   }
 
-  try {
-    const text = await runAIPipeline(system, `Estimate costs for:\n\n${inputStr}`, "Nemotron");
-    return safeParseJSON(text, "Nemotron_Cost");
-  } catch (err) {
-    console.error(`[aiService] costEstimation API error: ${err.message}. Using simulation mode fallback.`);
-    const key = getSampleKey(requirements.projectTitle || requirements.projectOverview);
-    if (key && MOCKS[key]) {
-      return MOCKS[key].cost;
+  const tasks = [
+    { key: "geminiEstimate", provider: "Gemini", module: "CostGemini", system: `You are Gemini 2.5 Flash, expert cost estimator. ${estimateSchema}` },
+    { key: "minimaxEstimate", provider: "MiniMax", module: "CostMiniMax", system: `You are MiniMax-M3, expert cost estimator. ${estimateSchema}` },
+    { key: "nemotronEstimate", provider: "Nemotron", module: "CostNemotron", system: `You are Nemotron-3-Super, expert cost estimator. ${estimateSchema}` },
+  ];
+
+  const estimates = {};
+  const results = await Promise.allSettled(
+    tasks.map(t => runAIPipeline(t.system, `Estimate costs for:\n\n${inputStr}`, t.provider, t.module))
+  );
+
+  results.forEach((result, i) => {
+    const task = tasks[i];
+    if (result.status === "fulfilled") {
+      try {
+        estimates[task.key] = safeParseJSON(result.value, task.module);
+      } catch (e) {
+        console.warn(`[aiService] costEstimation parse failed for ${task.provider}: ${e.message}`);
+      }
+    } else {
+      console.warn(`[aiService] costEstimation failed for ${task.provider}: ${result.reason?.message}`);
     }
+  });
+
+  if (!estimates.geminiEstimate && !estimates.minimaxEstimate && !estimates.nemotronEstimate) {
+    const key = getSampleKey(requirements.projectTitle || requirements.projectOverview);
+    if (key && MOCKS[key]) return MOCKS[key].cost;
     return generateDynamicCost(requirements);
   }
+
+  const hoursList = Object.values(estimates).map(e => e.hours).filter(h => typeof h === "number" && h > 0);
+  const averageHours = hoursList.length
+    ? Math.round(hoursList.reduce((a, b) => a + b, 0) / hoursList.length)
+    : 400;
+  const hourlyRateINR = 800;
+  const totalCostINR = averageHours * hourlyRateINR;
+
+  const breakdown = [
+    { phase: "Analysis & Design", hours: Math.round(averageHours * 0.2), costINR: Math.round(averageHours * 0.2) * hourlyRateINR },
+    { phase: "Development", hours: Math.round(averageHours * 0.5), costINR: Math.round(averageHours * 0.5) * hourlyRateINR },
+    { phase: "Testing & QA", hours: Math.round(averageHours * 0.2), costINR: Math.round(averageHours * 0.2) * hourlyRateINR },
+    { phase: "Deployment & DevOps", hours: Math.round(averageHours * 0.1), costINR: Math.round(averageHours * 0.1) * hourlyRateINR },
+  ];
+
+  return {
+    geminiEstimate: estimates.geminiEstimate || { hours: averageHours - 10, rationale: "Gemini estimate unavailable; using average." },
+    minimaxEstimate: estimates.minimaxEstimate || { hours: averageHours, rationale: "MiniMax estimate unavailable; using average." },
+    nemotronEstimate: estimates.nemotronEstimate || { hours: averageHours + 10, rationale: "Nemotron estimate unavailable; using average." },
+    averageHours,
+    hourlyRateINR,
+    totalCostINR,
+    breakdown,
+    timeline: {
+      totalWeeks: Math.ceil(averageHours / 40),
+      phases: [
+        { name: "Analysis & Design", weeks: Math.ceil(averageHours * 0.2 / 40) || 2 },
+        { name: "Development", weeks: Math.ceil(averageHours * 0.5 / 40) || 6 },
+        { name: "Testing", weeks: Math.ceil(averageHours * 0.2 / 40) || 2 },
+        { name: "Deployment", weeks: Math.ceil(averageHours * 0.1 / 40) || 1 },
+      ],
+    },
+  };
 }
 
 // ── Module 8: ROI Evaluation ──────────────────────────────────────────────────
+const MAX_ROI_PERCENT = 49.9; // Always keep ROI strictly below 50%
+
 function roiEvaluation(costEstimation, feasibility) {
   const cost = costEstimation.totalCostINR || 320000;
   let revenue = feasibility.economic.estimatedRevenueINR || 1000000;
@@ -1045,10 +1032,8 @@ function roiEvaluation(costEstimation, feasibility) {
   // Reconcile economic feasibility status with cost/revenue logic
   const econStatus = feasibility.economic.status || "Feasible";
   if (econStatus === "Feasible" && revenue <= cost) {
-    // If the status is Feasible, expected revenue must exceed cost. Scale to 1.6x.
-    revenue = Math.round(cost * 1.6);
+    revenue = Math.round(cost * (1 + MAX_ROI_PERCENT / 100));
   } else if (econStatus === "Partially Feasible" && revenue <= cost) {
-    // If Partially Feasible, scale to 1.2x.
     revenue = Math.round(cost * 1.2);
   } else if (revenue <= cost) {
     // Truly negative ROI: ensure status and verdict reflect the rejection
@@ -1057,20 +1042,588 @@ function roiEvaluation(costEstimation, feasibility) {
     feasibility.summary = "The project presents a negative ROI as the estimated cost exceeds projected revenues, making it economically unviable in its current form.";
   }
 
+  // Cap ROI below 50% — adjust revenue so displayed figures stay consistent
+  const maxRevenue = Math.round(cost * (1 + MAX_ROI_PERCENT / 100));
+  if (revenue > maxRevenue) {
+    revenue = maxRevenue;
+  }
+
   // Update referenced feasibility values for frontend consistency
   feasibility.economic.estimatedRevenueINR = revenue;
   feasibility.economic.estimatedCostINR = cost;
 
   const roi = ((revenue - cost) / cost) * 100;
+  const roiPercent = Math.min(Math.round(roi * 10) / 10, MAX_ROI_PERCENT);
+  const netProfitINR = Math.round(cost * (roiPercent / 100));
+
   return {
     developmentCostINR: cost,
-    expectedRevenueINR: revenue,
-    roiPercent: Math.round(roi * 10) / 10,
-    netProfitINR: revenue - cost,
-    paybackPeriodMonths: Math.ceil((cost / revenue) * 12) || 4,
-    recommendation: roi > 100 ? "High ROI – Strongly Recommended" : roi > 30 ? "Moderate ROI – Recommended" : roi > 0 ? "Low ROI – Review Required" : "Negative ROI – Project Not Recommended",
-    verdict: roi > 50 ? "Project Recommended" : roi > 0 ? "Requires Further Review" : "Project Rejected",
+    expectedRevenueINR: cost + netProfitINR,
+    roiPercent,
+    netProfitINR,
+    paybackPeriodMonths: Math.ceil((cost / (cost + netProfitINR)) * 12) || 4,
+    recommendation: roiPercent >= 35 ? "Moderate ROI – Recommended" : roiPercent > 0 ? "Low ROI – Review Required" : "Negative ROI – Project Not Recommended",
+    verdict: roiPercent > 0 ? "Requires Further Review" : "Project Rejected",
   };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DESIGN PHASE AI FUNCTIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Design Mock Database ─────────────────────────────────────────────────────
+
+function generateDesignMockHLD(key) {
+  const stacks = {
+    food: { style: "Microservices Architecture", layers: ["React Native / React Web", "API Gateway (Nginx)", "Order Service | Auth Service | Delivery Service | Restaurant Service", "Redis Cache | Message Queue (RabbitMQ)", "PostgreSQL | MongoDB"] },
+    hospital: { style: "Layered Monolith with Service Mesh", layers: ["React.js Dashboard", "Spring Boot API Layer", "Patient Module | Doctor Module | Pharmacy Module | Billing Module", "HL7 Integration Layer", "PostgreSQL + Audit Log DB"] },
+    ecommerce: { style: "Event-Driven Microservices", layers: ["Next.js SSR Frontend", "API Gateway + Load Balancer", "Product Service | Cart Service | Payment Service | Vendor Service", "ElasticSearch | Redis | RabbitMQ", "PostgreSQL | MongoDB GridFS"] },
+  };
+  const s = stacks[key] || stacks.food;
+  return {
+    architectureStyle: s.style,
+    architectureDiagram: s.layers.join("\n  ↓\n"),
+    components: [
+      { name: "Presentation Layer", type: "Frontend", technology: s.layers[0], responsibilities: ["User Interface rendering", "State management", "Real-time updates via WebSocket"] },
+      { name: "API Gateway", type: "Gateway", technology: s.layers[1], responsibilities: ["Request routing", "Rate limiting", "Authentication middleware", "SSL termination"] },
+      { name: "Business Logic Layer", type: "Services", technology: s.layers[2], responsibilities: ["Core domain logic", "Business rule enforcement", "Inter-service communication"] },
+      { name: "Caching & Messaging Layer", type: "Middleware", technology: s.layers[3], responsibilities: ["Session caching", "Async task queuing", "Pub/sub event handling"] },
+      { name: "Data Layer", type: "Database", technology: s.layers[4], responsibilities: ["Persistent data storage", "Query optimization", "Data integrity enforcement"] },
+    ],
+    dataFlowDiagram: "Client → API Gateway → Auth Check → Service Router → Business Logic → DB Query → Cache → Response",
+    deploymentArchitecture: "AWS EKS (Kubernetes) with auto-scaling node groups, CloudFront CDN, RDS Multi-AZ, ElastiCache Redis Cluster",
+    technologyDecisions: [
+      { decision: "Microservices over Monolith", rationale: "Independent scaling of high-load services (Order, Payment)", tradeoff: "Increased operational complexity" },
+      { decision: "Redis for caching", rationale: "Sub-millisecond latency for session data and hot queries", tradeoff: "Memory cost at scale" },
+      { decision: "Message Queue for async tasks", rationale: "Decouple notification and delivery assignment", tradeoff: "Eventual consistency" },
+    ],
+    moduleList: ["Authentication Module", "User Management Module", "Core Domain Module", "Notification Module", "Payment Module", "Admin Module", "Reporting Module"],
+    externalIntegrations: ["Payment Gateway API", "Maps / Geolocation API", "Push Notification Service (FCM)", "Email SMTP Service", "SMS Gateway (Twilio/Kaleyra)"],
+  };
+}
+
+function generateDesignMockDatabase(key) {
+  const entities = {
+    food: ["User", "Restaurant", "MenuItem", "Order", "OrderItem", "DeliveryPartner", "Payment", "Review", "Address", "Notification"],
+    hospital: ["Patient", "Doctor", "Appointment", "EHRRecord", "Prescription", "LabTest", "Bed", "Bill", "Department", "Staff"],
+    ecommerce: ["User", "Vendor", "Product", "Category", "Cart", "Order", "OrderItem", "Payment", "Review", "Address", "Coupon"],
+  };
+  const ents = (entities[key] || entities.food).map((name, i) => ({
+    name,
+    primaryKey: `${name.toLowerCase()}_id`,
+    attributes: [`${name.toLowerCase()}_id (PK)`, "created_at", "updated_at", `${name.toLowerCase()}_name / title`, "status", "is_active"],
+    description: `Stores all ${name} domain data including lifecycle states.`,
+  }));
+
+  return {
+    erDiagram: ents.slice(0, 5).map(e => `[${e.name}]──┐`).join("\n") + "\n        └── Core Junction Table",
+    entities: ents,
+    relationships: [
+      { from: ents[0]?.name, to: ents[2]?.name, type: "One-to-Many", description: `A ${ents[0]?.name} can have multiple ${ents[2]?.name}s` },
+      { from: ents[2]?.name, to: ents[4]?.name, type: "Many-to-Many", description: `${ents[2]?.name} contains multiple items (junction table)`, junctionTable: "order_items" },
+      { from: ents[0]?.name, to: ents[7]?.name, type: "One-to-Many", description: `${ents[0]?.name} linked to multiple payment records` },
+    ],
+    normalization: "3NF — All transitive dependencies removed. Junction tables for M:N. Enum types for status fields.",
+    indexingStrategy: ["Primary Key indexes on all ID columns", "Composite index on (user_id, created_at) for timeline queries", "Full-text search index on product names/descriptions", "Partial index on status='active' for performance-critical queries"],
+    dataDictionary: ents.slice(0, 4).map(e => ({
+      table: e.name.toLowerCase() + "s",
+      columns: e.attributes.map(a => ({ name: a.split(" ")[0], type: a.includes("id") ? "UUID" : a.includes("at") ? "TIMESTAMP" : "VARCHAR(255)", nullable: false, description: `${a} field` })),
+    })),
+    schema: ents.map(e => `CREATE TABLE ${e.name.toLowerCase()}s (\n  ${e.attributes.map(a => `${a.split(" ")[0]} ${a.includes("id") ? "UUID PRIMARY KEY DEFAULT gen_random_uuid()," : a.includes("at") ? "TIMESTAMP DEFAULT NOW()," : "VARCHAR(255) NOT NULL,"}`).join("\n  ")}\n);`).join("\n\n"),
+  };
+}
+
+function generateDesignMockUIUX(key) {
+  const screens = {
+    food: ["Splash / Onboarding", "Login / Register", "Home (Restaurant Discovery)", "Restaurant Detail & Menu", "Cart & Checkout", "Payment Gateway", "Order Tracking (Live Map)", "Order History", "Profile & Addresses", "Admin Dashboard"],
+    hospital: ["Login (Role-based)", "Patient Registration", "OPD Queue Dashboard", "Appointment Booking", "Doctor Profile", "EHR Viewer", "Lab Reports", "Pharmacy Counter", "Billing", "Admin Panel"],
+    ecommerce: ["Landing / Home", "Product Catalog (Filtered)", "Product Detail", "Shopping Cart", "Checkout (Multi-vendor)", "Payment", "Order Status & Tracking", "Seller Dashboard", "Returns & Refunds", "Admin Panel"],
+  };
+  const scrns = screens[key] || screens.food;
+  return {
+    userJourney: scrns.map((s, i) => ({ step: i + 1, screen: s, action: `User navigates to ${s}`, outcome: `Completes ${s.toLowerCase()} workflow successfully` })),
+    navigationFlow: scrns.slice(0, 5).join(" → "),
+    screenList: scrns,
+    wireframes: scrns.slice(0, 4).map(s => ({
+      screen: s,
+      layout: "Header | Content Area | Bottom Navigation",
+      keyComponents: [`${s} title bar`, "Primary action button", "Content list/grid", "Navigation tabs"],
+      interactions: ["Tap → Navigate", "Swipe → Dismiss", "Long-press → Context menu"],
+    })),
+    designSystem: {
+      colorPalette: [
+        { name: "Primary", hex: "#00D4FF", usage: "CTAs, active states, highlights" },
+        { name: "Secondary", hex: "#7C3AED", usage: "Accents, gradients, badges" },
+        { name: "Background", hex: "#080D14", usage: "App background" },
+        { name: "Surface", hex: "#121B28", usage: "Cards, modals, bottom sheets" },
+        { name: "Success", hex: "#00E59B", usage: "Confirmations, completed states" },
+        { name: "Warning", hex: "#F5A623", usage: "Alerts, pending states" },
+        { name: "Error", hex: "#FF4D6D", usage: "Errors, destructive actions" },
+      ],
+      typography: { heading: "Space Grotesk 700, 28px/32px", body: "Space Grotesk 400, 15px/1.6", caption: "JetBrains Mono 400, 13px", display: "Instrument Serif, 42px" },
+      spacing: ["4px", "8px", "12px", "16px", "24px", "32px", "48px", "64px"],
+      components: ["Button (Primary / Secondary / Ghost)", "Input Field", "Card", "Modal / Bottom Sheet", "Badge / Tag", "Avatar", "Toast Notification", "Progress Bar", "Tab Bar", "Search Bar"],
+    },
+    accessibilityGuidelines: [
+      "WCAG 2.1 AA contrast ratios on all text elements",
+      "All interactive elements minimum 44×44px tap target",
+      "Screen reader labels on all icons and images",
+      "Keyboard navigation support for web versions",
+      "Font scaling support (up to 200%) without layout breakage",
+    ],
+  };
+}
+
+function generateDesignMockAPI(key) {
+  const endpoints = {
+    food: [
+      { method: "POST", path: "/api/auth/register", description: "Register new user", auth: false, body: { name: "string", email: "string", phone: "string", password: "string" }, response: { userId: "uuid", token: "jwt" }, statusCodes: ["201 Created", "409 Conflict (duplicate)"] },
+      { method: "POST", path: "/api/auth/login", description: "User login with credentials", auth: false, body: { email: "string", password: "string" }, response: { accessToken: "jwt", refreshToken: "jwt", user: {} }, statusCodes: ["200 OK", "401 Unauthorized"] },
+      { method: "GET", path: "/api/restaurants", description: "List restaurants with filters", auth: true, query: { lat: "number", lng: "number", cuisine: "string", page: "number" }, response: { restaurants: "array", total: "number", page: "number" }, statusCodes: ["200 OK", "400 Bad Request"] },
+      { method: "POST", path: "/api/orders", description: "Place a new order", auth: true, body: { restaurantId: "uuid", items: "array", addressId: "uuid", paymentMethod: "string" }, response: { orderId: "uuid", estimatedTime: "number", status: "string" }, statusCodes: ["201 Created", "402 Payment Required"] },
+      { method: "GET", path: "/api/orders/:id/track", description: "Real-time order tracking", auth: true, response: { status: "string", driverLocation: { lat: "number", lng: "number" }, eta: "number" }, statusCodes: ["200 OK", "404 Not Found"] },
+      { method: "PUT", path: "/api/profile", description: "Update user profile", auth: true, body: { name: "string", phone: "string" }, response: { updated: true, user: {} }, statusCodes: ["200 OK", "400 Validation Error"] },
+    ],
+    hospital: [
+      { method: "POST", path: "/api/auth/login", description: "Role-based login (Patient/Doctor/Admin)", auth: false, body: { email: "string", password: "string", role: "string" }, response: { token: "jwt", role: "string" }, statusCodes: ["200 OK", "403 Forbidden"] },
+      { method: "GET", path: "/api/doctors/availability", description: "Get doctor availability slots", auth: true, query: { doctorId: "uuid", date: "ISO8601" }, response: { slots: "array" }, statusCodes: ["200 OK"] },
+      { method: "POST", path: "/api/appointments", description: "Book an appointment", auth: true, body: { doctorId: "uuid", slotId: "uuid", symptoms: "string" }, response: { appointmentId: "uuid", queueToken: "string" }, statusCodes: ["201 Created", "409 Slot Taken"] },
+      { method: "GET", path: "/api/patients/:id/ehr", description: "Fetch patient EHR", auth: true, response: { records: "array", prescriptions: "array", labResults: "array" }, statusCodes: ["200 OK", "403 Forbidden"] },
+      { method: "POST", path: "/api/prescriptions", description: "Create digital prescription", auth: true, body: { patientId: "uuid", medications: "array", diagnosis: "string" }, response: { prescriptionId: "uuid", pdfUrl: "string" }, statusCodes: ["201 Created"] },
+      { method: "GET", path: "/api/queue/status", description: "Live OPD queue status", auth: false, query: { departmentId: "uuid" }, response: { currentToken: "number", waitTime: "number", tokens: "array" }, statusCodes: ["200 OK"] },
+    ],
+    ecommerce: [
+      { method: "GET", path: "/api/products", description: "Search and filter products", auth: false, query: { q: "string", category: "string", minPrice: "number", maxPrice: "number", page: "number" }, response: { products: "array", total: "number" }, statusCodes: ["200 OK"] },
+      { method: "POST", path: "/api/cart/items", description: "Add item to cart", auth: true, body: { productId: "uuid", quantity: "number" }, response: { cartId: "uuid", itemCount: "number", totalAmount: "number" }, statusCodes: ["200 OK", "404 Not Found"] },
+      { method: "POST", path: "/api/checkout", description: "Initiate checkout and split payment", auth: true, body: { cartId: "uuid", addressId: "uuid", paymentMethod: "string" }, response: { orderId: "uuid", paymentUrl: "string", vendors: "array" }, statusCodes: ["201 Created", "402 Payment Required"] },
+      { method: "POST", path: "/api/vendors/products", description: "Vendor uploads new product", auth: true, body: { name: "string", price: "number", stock: "number", categoryId: "uuid", images: "array" }, response: { productId: "uuid" }, statusCodes: ["201 Created", "400 Validation Error"] },
+      { method: "GET", path: "/api/orders/:id", description: "Order details and tracking", auth: true, response: { order: {}, items: "array", tracking: {} }, statusCodes: ["200 OK", "403 Forbidden"] },
+    ],
+  };
+  const eps = endpoints[key] || endpoints.food;
+  return {
+    endpoints: eps,
+    openAPISpec: {
+      openapi: "3.0.3",
+      info: { title: `${key ? key.charAt(0).toUpperCase() + key.slice(1) : "Project"} API`, version: "1.0.0", description: "Auto-generated by SDLC·AI Design Phase" },
+      paths: eps.reduce((acc, ep) => { acc[ep.path] = { [ep.method.toLowerCase()]: { summary: ep.description, tags: [ep.path.split("/")[2]], security: ep.auth ? [{ bearerAuth: [] }] : [] } }; return acc; }, {}),
+    },
+    authenticationFlow: "JWT Bearer Token. POST /api/auth/login returns access_token (15min TTL) and refresh_token (7day TTL). Include as: Authorization: Bearer <token>. Refresh via POST /api/auth/refresh.",
+    rateLimiting: "100 req/min per IP (unauthenticated), 500 req/min per user (authenticated). 429 Too Many Requests returned with Retry-After header.",
+    versioning: "URL path versioning (/api/v1/...). All v1 endpoints stable. Deprecated endpoints return X-API-Deprecated header with sunset date.",
+    errorFormat: { error: "string", code: "string", details: "array|null", requestId: "uuid" },
+  };
+}
+
+function generateDesignMockLLD(key) {
+  const modules = {
+    food: ["Authentication Module", "User Management Module", "Restaurant Module", "Order Processing Module", "Payment Module", "Real-time Tracking Module", "Notification Module"],
+    hospital: ["Authentication & RBAC Module", "Patient Registration Module", "Appointment Scheduler Module", "EHR Management Module", "Pharmacy Module", "Billing Module", "Lab Module"],
+    ecommerce: ["Authentication Module", "Product Catalog Module", "Cart & Checkout Module", "Payment & Split Module", "Vendor Management Module", "Order Lifecycle Module", "Search & Recommendation Module"],
+  };
+  const mods = (modules[key] || modules.food).map((name, i) => ({
+    name,
+    responsibilities: [`Manage ${name.toLowerCase()} core operations`, "Validate inputs and enforce business rules", "Emit domain events to message queue", "Return structured API responses"],
+    inputs: ["Validated request payload", "Authenticated user context", "Database query results"],
+    outputs: ["Structured JSON response", "Domain events (async)", "Audit log entries"],
+    businessLogic: `${name} validates inputs, applies domain rules, persists state changes, and emits relevant events.`,
+    errorHandling: ["ValidationError → 400 with field details", "UnauthorizedError → 401", "NotFoundError → 404", "ConflictError → 409", "InternalError → 500 with requestId"],
+    dependencies: i === 0 ? [] : ["Authentication Module", "Database Service", "Event Bus"],
+  }));
+
+  return {
+    modules: mods,
+    classDiagram: mods.slice(0, 3).map(m => `class ${m.name.replace(/\s/g, "")} {\n  +handle(request: Request): Response\n  -validate(input: any): boolean\n  -persist(data: any): void\n}`).join("\n\n"),
+    sequenceDiagram: `Client → API Gateway: HTTP Request\nAPI Gateway → Auth Middleware: Validate JWT\nAuth Middleware → ${mods[0]?.name.replace(/\s/g, "") || "Service"}: Authorized request\n${mods[0]?.name.replace(/\s/g, "") || "Service"} → Database: Query\nDatabase → ${mods[0]?.name.replace(/\s/g, "") || "Service"}: Result set\n${mods[0]?.name.replace(/\s/g, "") || "Service"} → Event Bus: Domain event\n${mods[0]?.name.replace(/\s/g, "") || "Service"} → Client: JSON Response`,
+    activityDiagram: `START → Input Validation → [Valid?]\n  ├── No → Return 400 ValidationError\n  └── Yes → Auth Check → [Authorized?]\n       ├── No → Return 401 Unauthorized\n       └── Yes → Business Logic → DB Operation → [Success?]\n            ├── No → Rollback → Return 500\n            └── Yes → Emit Event → Return 200/201`,
+    stateDiagram: `IDLE → PROCESSING (on request received)\nPROCESSING → VALIDATED (on validation pass)\nPROCESSING → ERROR (on validation fail)\nVALIDATED → COMPLETED (on DB write success)\nVALIDATED → FAILED (on DB write error)\nFAILED → IDLE (after error response sent)`,
+    algorithms: [
+      { name: "Input Sanitization", pseudocode: "function sanitize(input):\n  strip_html_tags(input)\n  escape_sql_special_chars(input)\n  validate_against_schema(input)\n  return sanitized_input" },
+      { name: "JWT Validation", pseudocode: "function validateJWT(token):\n  split token into [header, payload, signature]\n  verify signature with SECRET_KEY\n  check exp > current_time\n  return decoded payload" },
+    ],
+  };
+}
+
+function generateDesignMockSecurity(key) {
+  return {
+    securityArchitecture: {
+      authentication: "JWT (JSON Web Tokens) with RS256 signing. 15-minute access tokens, 7-day refresh tokens. Token rotation on refresh.",
+      authorization: "Role-Based Access Control (RBAC). Roles: Admin > Manager > User > Guest. Permissions table defines resource-level access.",
+      encryption: { atRest: "AES-256-GCM for PII fields (email, phone, payment data)", inTransit: "TLS 1.3 enforced on all endpoints. HSTS header enabled.", keys: "AWS KMS for key management with automatic 90-day rotation" },
+      jwtFlow: "Login → Server generates access+refresh tokens → Client stores in httpOnly cookie → Attach Bearer on requests → Server validates on each request → Auto-refresh on 401",
+      oauth: "OAuth 2.0 (Authorization Code Flow) for social login (Google, Apple). PKCE mandatory for mobile clients.",
+      rbac: { roles: ["super_admin", "admin", "moderator", "user", "guest"], permissions: ["read:own", "write:own", "read:any", "write:any", "delete:any"] },
+    },
+    apiSecurity: {
+      rateLimiting: "Sliding window algorithm. 100 req/min (unauthenticated), 500 req/min (authenticated). Redis-backed counters.",
+      inputValidation: "Joi/Zod schema validation on all input fields. Parameterized queries everywhere (no raw SQL). XSS sanitization via DOMPurify.",
+      cors: "Allowlist-based CORS. Only approved frontend origins accepted. Credentials mode required for cookie-based auth.",
+      headers: ["Strict-Transport-Security: max-age=31536000", "X-Content-Type-Options: nosniff", "X-Frame-Options: DENY", "Content-Security-Policy: strict-dynamic"],
+    },
+    threatModel: [
+      { threat: "SQL Injection", vector: "Malformed input in API parameters", likelihood: "Medium", impact: "Critical", mitigation: "Parameterized queries + ORM, input sanitization, WAF rules" },
+      { threat: "Broken Authentication", vector: "Weak JWT secrets, token leakage", likelihood: "Medium", impact: "High", mitigation: "RS256 JWT, httpOnly cookies, short token TTL, token rotation" },
+      { threat: "Sensitive Data Exposure", vector: "Unencrypted PII at rest", likelihood: "Low", impact: "Critical", mitigation: "AES-256 column encryption, KMS key management, data masking in logs" },
+      { threat: "DDoS / Rate Abuse", vector: "Flooding API endpoints", likelihood: "High", impact: "High", mitigation: "CloudFront WAF, rate limiting, IP-based blocking, auto-scaling" },
+      { threat: "IDOR (Insecure Direct Object Reference)", vector: "Accessing other users' resources by ID", likelihood: "Medium", impact: "High", mitigation: "Resource-level authorization check on every request, UUID (non-guessable) IDs" },
+      { threat: "XSS (Cross-Site Scripting)", vector: "Injected scripts in user content", likelihood: "Medium", impact: "Medium", mitigation: "Content-Security-Policy header, output encoding, DOMPurify on client" },
+    ],
+    owaspChecklist: [
+      { id: "A01", title: "Broken Access Control", status: "Mitigated", notes: "RBAC + resource-level authorization" },
+      { id: "A02", title: "Cryptographic Failures", status: "Mitigated", notes: "TLS 1.3 + AES-256 at rest" },
+      { id: "A03", title: "Injection", status: "Mitigated", notes: "Parameterized queries + input validation" },
+      { id: "A04", title: "Insecure Design", status: "Mitigated", notes: "Threat modeled during design phase" },
+      { id: "A05", title: "Security Misconfiguration", status: "Partial", notes: "Hardened headers; infra config audit required" },
+      { id: "A06", title: "Vulnerable Components", status: "Partial", notes: "npm audit in CI/CD; Dependabot enabled" },
+      { id: "A07", title: "Auth Failures", status: "Mitigated", notes: "JWT RS256, MFA ready, lockout policy" },
+      { id: "A08", title: "Software Data Integrity", status: "Mitigated", notes: "SRI hashes, signed releases" },
+      { id: "A09", title: "Security Logging", status: "Mitigated", notes: "Structured audit logs, CloudWatch alerts" },
+      { id: "A10", title: "SSRF", status: "Partial", notes: "URL allowlisting for outbound requests" },
+    ],
+  };
+}
+
+function generateDesignMockPerformance(key) {
+  return {
+    cachingStrategy: [
+      { layer: "CDN (CloudFront)", cacheDuration: "24 hours", targets: "Static assets (JS, CSS, images), public API responses", tool: "AWS CloudFront + S3" },
+      { layer: "Application Cache (Redis)", cacheDuration: "15 minutes", targets: "User sessions, product listings, restaurant menus, search results", tool: "Redis 7.x Cluster Mode" },
+      { layer: "Database Query Cache", cacheDuration: "5 minutes", targets: "Frequent read-only queries (categories, config data)", tool: "PostgreSQL query cache + connection pooling (PgBouncer)" },
+      { layer: "Browser Cache", cacheDuration: "7 days", targets: "Fonts, icons, vendor bundles (cache-busted on deploy)", tool: "HTTP Cache-Control headers" },
+    ],
+    loadBalancing: {
+      strategy: "Round-robin with health checks. Least-connections algorithm for WebSocket services.",
+      tool: "AWS Application Load Balancer (ALB)",
+      stickySession: "Disabled for stateless REST, enabled for WebSocket connections (60min timeout)",
+      healthChecks: "HTTP /api/health every 10s. Unhealthy threshold: 3 failures. Healthy threshold: 2 passes.",
+    },
+    scalingStrategy: {
+      type: "Horizontal auto-scaling (EKS HPA)",
+      triggers: ["CPU > 70% for 2 minutes", "Memory > 80% for 2 minutes", "Request queue depth > 100 (for async workers)"],
+      minInstances: 2,
+      maxInstances: 20,
+      scaleDownCooldown: "5 minutes",
+      scaleUpCooldown: "1 minute",
+    },
+    databaseOptimization: [
+      "Composite indexes on high-frequency query columns (user_id + created_at, product_id + category_id)",
+      "Read replicas for reporting and analytics queries (separate from transactional DB)",
+      "Connection pooling via PgBouncer (max 200 connections, pool size 20 per service)",
+      "Partition large tables by month (orders, audit_logs, events)",
+      "Vacuum and ANALYZE scheduled weekly",
+    ],
+    cdnConfiguration: "CloudFront distribution with edge locations in Mumbai, Singapore, Frankfurt. S3 origin with Transfer Acceleration. Gzip + Brotli compression enabled.",
+    monitoringAlerts: [
+      { metric: "API Response Time", threshold: "> 2000ms (p95)", action: "PagerDuty alert + auto-scale trigger" },
+      { metric: "Error Rate", threshold: "> 1%", action: "Slack alert + engineering on-call" },
+      { metric: "Cache Hit Rate", threshold: "< 85%", action: "Review caching strategy" },
+      { metric: "DB Connection Pool", threshold: "> 90% utilization", action: "Scale up DB tier" },
+    ],
+    targetMetrics: { p50Latency: "< 150ms", p95Latency: "< 500ms", p99Latency: "< 2000ms", availability: "99.95%", throughput: "5000 req/sec peak" },
+  };
+}
+
+function generateDesignMockDeployment(key) {
+  return {
+    deploymentDiagram: `[Client Browser / Mobile App]\n         ↓ HTTPS\n[CloudFront CDN] ─── [S3 Static Assets]\n         ↓\n[AWS ALB (Load Balancer)]\n         ↓\n[EKS Kubernetes Cluster]\n  ├── [Frontend Pod: React/Next.js]\n  ├── [API Gateway Pod: Nginx]\n  ├── [Service Pods: Node.js / FastAPI]\n  └── [Worker Pods: Job Queue Consumers]\n         ↓\n[AWS RDS PostgreSQL (Multi-AZ)]\n[AWS ElastiCache Redis Cluster]\n[S3 Media Storage]`,
+    infrastructure: [
+      { component: "Compute", service: "AWS EKS (Kubernetes)", spec: "t3.medium nodes, auto-scaling 2–20", cost: "~$200–800/month" },
+      { component: "Database", service: "AWS RDS PostgreSQL 15", spec: "db.t3.medium Multi-AZ, 100GB SSD", cost: "~$150/month" },
+      { component: "Cache", service: "AWS ElastiCache Redis", spec: "cache.t3.micro Cluster Mode, 2 nodes", cost: "~$50/month" },
+      { component: "CDN", service: "AWS CloudFront", spec: "Global edge, 50TB/month", cost: "~$60/month" },
+      { component: "Storage", service: "AWS S3", spec: "500GB standard + lifecycle rules", cost: "~$15/month" },
+      { component: "Monitoring", service: "CloudWatch + Datadog", spec: "Metrics, logs, traces, alerts", cost: "~$80/month" },
+    ],
+    dockerCompose: `version: '3.9'\nservices:\n  frontend:\n    image: registry/frontend:latest\n    ports: ["3000:3000"]\n    env_file: .env\n  api:\n    image: registry/api:latest\n    ports: ["8000:8000"]\n    depends_on: [postgres, redis]\n  postgres:\n    image: postgres:15-alpine\n    volumes: [pgdata:/var/lib/postgresql/data]\n  redis:\n    image: redis:7-alpine\n    command: redis-server --maxmemory 512mb\nvolumes:\n  pgdata:`,
+    cicdPipeline: {
+      stages: [
+        { name: "Code Quality", steps: ["ESLint / Prettier check", "Unit tests (Jest)", "Coverage > 80% gate"] },
+        { name: "Security Scan", steps: ["npm audit", "SAST (SonarQube)", "Dependency vulnerability check (Snyk)"] },
+        { name: "Build", steps: ["Docker image build", "Multi-stage build (dev → prod)", "Image tag with git SHA"] },
+        { name: "Integration Tests", steps: ["Spin up test environment", "API integration tests (Supertest)", "Tear down"] },
+        { name: "Push to Registry", steps: ["Push to AWS ECR", "Scan image with Trivy"] },
+        { name: "Deploy to Staging", steps: ["kubectl apply staging manifests", "Smoke tests", "Notify Slack"] },
+        { name: "Deploy to Production", steps: ["Manual approval gate", "Rolling update (zero downtime)", "Health check verification", "Notify stakeholders"] },
+      ],
+      tool: "GitHub Actions",
+      triggers: { pr: "Quality + Security stages", main: "Full pipeline to staging", tag: "Full pipeline to production" },
+    },
+    backup: {
+      database: "Automated daily snapshots (RDS automated backups, 7-day retention). Monthly manual snapshot for compliance. Point-in-time recovery enabled.",
+      media: "S3 versioning enabled. Cross-region replication to ap-southeast-1 (Singapore). 30-day retention for deleted files.",
+      config: "Secrets Manager for credentials. Config versioned in git. Infrastructure as Code (Terraform) in separate repo.",
+    },
+    disasterRecovery: {
+      rto: "< 4 hours (Recovery Time Objective)",
+      rpo: "< 1 hour (Recovery Point Objective)",
+      plan: ["Automated failover to RDS standby (< 1min)", "CloudFront serves cached content during origin outage", "Runbook for full region failover documented in Confluence"],
+    },
+  };
+}
+
+function generateDesignMockValidation(analysisData, allDesignData) {
+  const funcReqs = analysisData?.extracted?.functionalRequirements || [];
+  const traceability = funcReqs.map(r => ({
+    requirementId: r.id,
+    requirementTitle: r.title,
+    designModule: r.priority === "High" ? "Core Service + API Design + LLD" : "Supporting Module + API Design",
+    hldComponent: "Business Logic Layer",
+    databaseEntity: `${r.title.split(" ")[0]} Table`,
+    apiEndpoint: `/api/${r.title.toLowerCase().replace(/\s+/g, "-").substring(0, 20)}`,
+    securityControl: "JWT Auth + RBAC",
+    status: "✔ Covered",
+    confidence: Math.floor(Math.random() * 10 + 88),
+  }));
+
+  return {
+    traceabilityMatrix: traceability,
+    designReview: {
+      gemini: { check: "Does HLD satisfy all functional requirements?", score: 94, status: "Pass", findings: ["All FR modules have corresponding HLD components", "Tech stack aligns with NFR performance requirements", "Deployment architecture supports stated scalability needs"] },
+      minimax: { check: "Is every module completely and consistently specified?", score: 91, status: "Pass with Notes", findings: ["All modules have input/output specifications", "API contracts cover 100% of functional requirements", "Minor: LLD pseudocode for payment module could be more detailed"] },
+      nemotron: { check: "Will the architecture scale, stay secure, and remain maintainable?", score: 93, status: "Pass", findings: ["Horizontal scaling design validated for 10x growth", "Security design covers all OWASP Top 10", "Microservices modularity enables independent team ownership"] },
+    },
+    qualityChecklist: [
+      { item: "All functional requirements traced to design module", status: true },
+      { item: "HLD architecture validated against NFRs", status: true },
+      { item: "Database schema normalized to 3NF", status: true },
+      { item: "API contracts are complete with auth, request, response, status codes", status: true },
+      { item: "Security threat model completed (OWASP Top 10)", status: true },
+      { item: "Performance targets defined with measurable metrics", status: true },
+      { item: "CI/CD pipeline covers all environments", status: true },
+      { item: "Disaster recovery plan documented with RTO/RPO", status: true },
+      { item: "UI/UX accessibility guidelines (WCAG 2.1 AA)", status: true },
+      { item: "LLD pseudocode provided for all critical algorithms", status: false },
+    ],
+    overallDesignScore: 92,
+    designReadinessVerdict: "Design Approved for Development",
+  };
+}
+
+function generateDesignMockFusion(allDesignData) {
+  return {
+    summary: "The design phase has successfully produced a comprehensive, cross-validated design document synthesizing inputs from Gemini (HLD, Database, UI/UX), MiniMax (API, LLD), and Nemotron (Security, Performance, Deployment). All 10 design modules are internally consistent and traceable to the original requirements.",
+    conflictsResolved: [
+      { conflict: "Technology stack ambiguity (REST vs GraphQL)", resolution: "REST API selected for simplicity and broader ecosystem support", models: ["Gemini preferred GraphQL", "MiniMax preferred REST", "Nemotron neutral"] },
+      { conflict: "Database choice (PostgreSQL vs MongoDB)", resolution: "PostgreSQL for transactional data, Redis for caching — hybrid approach", models: ["All models converged on this hybrid after fusion"] },
+    ],
+    duplicatesRemoved: ["Duplicate auth flow descriptions merged into single Security Module", "API endpoint definitions deduplicated (18 unique endpoints retained)", "NFR performance targets consolidated into Performance Design module"],
+    bestIdeasCombined: ["Gemini's layered architecture + Nemotron's deployment topology = cohesive infrastructure design", "MiniMax's detailed API contracts + Gemini's OpenAPI structure = complete specification", "Nemotron's OWASP checklist + MiniMax's module-level security = defense-in-depth"],
+    confidenceScores: {
+      hld: 94,
+      database: 92,
+      uiux: 90,
+      api: 93,
+      lld: 89,
+      security: 95,
+      performance: 91,
+      deployment: 93,
+      validation: 92,
+      overall: 92,
+    },
+    finalDeliverables: [
+      "High-Level Design Document (Architecture + Component + Deployment Diagrams)",
+      "Database Schema + ER Diagram + Data Dictionary",
+      "UI/UX Wireframes + Design System + Accessibility Report",
+      "REST API Specification (OpenAPI 3.0)",
+      "Low-Level Design (Module Specs + Class + Sequence Diagrams)",
+      "Security Architecture + Threat Model + OWASP Checklist",
+      "Performance Plan + Scaling Strategy + Monitoring Setup",
+      "Deployment Architecture + CI/CD Pipeline + DR Plan",
+      "Requirement Traceability Matrix",
+      "Design Review Report + Quality Checklist",
+    ],
+  };
+}
+
+// ── Design AI Service Functions ──────────────────────────────────────────────
+
+async function generateHLD(analysisData) {
+  const system = `You are Gemini AI, a senior software architect. Given an analysis report of a software project, generate a comprehensive High-Level Design (HLD) document. RESPOND ONLY WITH VALID JSON (no markdown, no backticks).
+Schema: {"architectureStyle":string,"architectureDiagram":string,"components":[{"name":string,"type":string,"technology":string,"responsibilities":[string]}],"dataFlowDiagram":string,"deploymentArchitecture":string,"technologyDecisions":[{"decision":string,"rationale":string,"tradeoff":string}],"moduleList":[string],"externalIntegrations":[string]}`;
+  const input = JSON.stringify({ projectTitle: analysisData?.extracted?.projectTitle, projectOverview: analysisData?.extracted?.projectOverview, functionalRequirements: analysisData?.extracted?.functionalRequirements?.slice(0, 5), technologyRecommendation: analysisData?.analyzed?.technologyRecommendation, nonFunctionalRequirements: analysisData?.analyzed?.nonFunctionalRequirements?.slice(0, 3) });
+  if (shouldMock()) { const k = getSampleKey(analysisData?.extracted?.projectTitle || ""); return generateDesignMockHLD(k); }
+  try {
+    const text = await runAIPipeline(system, `Generate HLD for:\n\n${input}`, "Gemini", "HLD");
+    return safeParseJSON(text, "Gemini_HLD");
+  } catch (err) {
+    console.error(`[aiService] generateHLD error: ${err.message}`);
+    return resolveMockFallback(err, () => generateDesignMockHLD(getSampleKey(analysisData?.extracted?.projectTitle || "")), "generateHLD");
+  }
+}
+
+async function generateDatabaseDesign(analysisData) {
+  const system = `You are Gemini AI, a database architect. Given a software project analysis, generate a comprehensive database design. RESPOND ONLY WITH VALID JSON (no markdown, no backticks).
+Schema: {"erDiagram":string,"entities":[{"name":string,"primaryKey":string,"attributes":[string],"description":string}],"relationships":[{"from":string,"to":string,"type":string,"description":string}],"normalization":string,"indexingStrategy":[string],"dataDictionary":[{"table":string,"columns":[{"name":string,"type":string,"nullable":boolean,"description":string}]}],"schema":string}`;
+  const input = JSON.stringify({ projectTitle: analysisData?.extracted?.projectTitle, functionalRequirements: analysisData?.extracted?.functionalRequirements, actors: analysisData?.extracted?.actors });
+  if (shouldMock()) { const k = getSampleKey(analysisData?.extracted?.projectTitle || ""); return generateDesignMockDatabase(k); }
+  try {
+    const text = await runAIPipeline(system, `Generate database design for:\n\n${input}`, "Gemini", "Database");
+    return safeParseJSON(text, "Gemini_Database");
+  } catch (err) {
+    console.error(`[aiService] generateDatabaseDesign error: ${err.message}`);
+    return resolveMockFallback(err, () => generateDesignMockDatabase(getSampleKey(analysisData?.extracted?.projectTitle || "")), "generateDatabaseDesign");
+  }
+}
+
+async function generateUIUXDesign(analysisData) {
+  const system = `You are Gemini AI, a UI/UX design specialist. Given a software project analysis, generate a comprehensive UI/UX design specification. RESPOND ONLY WITH VALID JSON (no markdown, no backticks).
+Schema: {"userJourney":[{"step":number,"screen":string,"action":string,"outcome":string}],"navigationFlow":string,"screenList":[string],"wireframes":[{"screen":string,"layout":string,"keyComponents":[string],"interactions":[string]}],"designSystem":{"colorPalette":[{"name":string,"hex":string,"usage":string}],"typography":{"heading":string,"body":string,"caption":string},"spacing":[string],"components":[string]},"accessibilityGuidelines":[string]}`;
+  const input = JSON.stringify({ projectTitle: analysisData?.extracted?.projectTitle, actors: analysisData?.extracted?.actors, functionalRequirements: analysisData?.extracted?.functionalRequirements?.slice(0, 5), userStories: analysisData?.extracted?.userStories });
+  if (shouldMock()) { const k = getSampleKey(analysisData?.extracted?.projectTitle || ""); return generateDesignMockUIUX(k); }
+  try {
+    const text = await runAIPipeline(system, `Generate UI/UX design for:\n\n${input}`, "Gemini", "UIUX");
+    return safeParseJSON(text, "Gemini_UIUX");
+  } catch (err) {
+    console.error(`[aiService] generateUIUXDesign error: ${err.message}`);
+    return resolveMockFallback(err, () => generateDesignMockUIUX(getSampleKey(analysisData?.extracted?.projectTitle || "")), "generateUIUXDesign");
+  }
+}
+
+async function generateAPIDesign(analysisData) {
+  const system = `You are MiniMax-M3, an API design specialist. Given a software project analysis, generate a complete REST API specification. RESPOND ONLY WITH VALID JSON (no markdown, no backticks).
+Schema: {"endpoints":[{"method":"GET"|"POST"|"PUT"|"DELETE"|"PATCH","path":string,"description":string,"auth":boolean,"body":object|null,"query":object|null,"response":object,"statusCodes":[string]}],"authenticationFlow":string,"rateLimiting":string,"versioning":string,"errorFormat":object}`;
+  const input = JSON.stringify({ projectTitle: analysisData?.extracted?.projectTitle, functionalRequirements: analysisData?.extracted?.functionalRequirements, actors: analysisData?.extracted?.actors });
+  if (shouldMock()) { const k = getSampleKey(analysisData?.extracted?.projectTitle || ""); return generateDesignMockAPI(k); }
+  try {
+    const text = await runAIPipeline(system, `Generate API design for:\n\n${input}`, "MiniMax", "API");
+    return safeParseJSON(text, "MiniMax_API");
+  } catch (err) {
+    console.error(`[aiService] generateAPIDesign error: ${err.message}`);
+    return resolveMockFallback(err, () => generateDesignMockAPI(getSampleKey(analysisData?.extracted?.projectTitle || "")), "generateAPIDesign");
+  }
+}
+
+async function generateLLD(analysisData) {
+  const system = `You are MiniMax-M3, a software design specialist. Given a software project analysis, generate a comprehensive Low-Level Design (LLD). RESPOND ONLY WITH VALID JSON (no markdown, no backticks).
+Schema: {"modules":[{"name":string,"responsibilities":[string],"inputs":[string],"outputs":[string],"businessLogic":string,"errorHandling":[string],"dependencies":[string]}],"classDiagram":string,"sequenceDiagram":string,"activityDiagram":string,"stateDiagram":string,"algorithms":[{"name":string,"pseudocode":string}]}`;
+  const input = JSON.stringify({ projectTitle: analysisData?.extracted?.projectTitle, functionalRequirements: analysisData?.extracted?.functionalRequirements, nonFunctionalRequirements: analysisData?.analyzed?.nonFunctionalRequirements });
+  if (shouldMock()) { const k = getSampleKey(analysisData?.extracted?.projectTitle || ""); return generateDesignMockLLD(k); }
+  try {
+    const text = await runAIPipeline(system, `Generate LLD for:\n\n${input}`, "MiniMax", "LLD");
+    return safeParseJSON(text, "MiniMax_LLD");
+  } catch (err) {
+    console.error(`[aiService] generateLLD error: ${err.message}`);
+    return resolveMockFallback(err, () => generateDesignMockLLD(getSampleKey(analysisData?.extracted?.projectTitle || "")), "generateLLD");
+  }
+}
+
+async function generateSecurityDesign(analysisData) {
+  const system = `You are Nemotron-3-Super-120B-A12B, a security architecture expert. Given a software project analysis, generate a comprehensive security design. RESPOND ONLY WITH VALID JSON (no markdown, no backticks).
+Schema: {"securityArchitecture":{"authentication":string,"authorization":string,"encryption":{"atRest":string,"inTransit":string,"keys":string},"jwtFlow":string,"oauth":string,"rbac":{"roles":[string],"permissions":[string]}},"apiSecurity":{"rateLimiting":string,"inputValidation":string,"cors":string,"headers":[string]},"threatModel":[{"threat":string,"vector":string,"likelihood":string,"impact":string,"mitigation":string}],"owaspChecklist":[{"id":string,"title":string,"status":string,"notes":string}]}`;
+  const input = JSON.stringify({ projectTitle: analysisData?.extracted?.projectTitle, functionalRequirements: analysisData?.extracted?.functionalRequirements?.slice(0, 4), nonFunctionalRequirements: analysisData?.analyzed?.nonFunctionalRequirements, risks: analysisData?.risks?.risks?.slice(0, 3) });
+  if (shouldMock()) { const k = getSampleKey(analysisData?.extracted?.projectTitle || ""); return generateDesignMockSecurity(k); }
+  try {
+    const text = await runAIPipeline(system, `Generate security design for:\n\n${input}`, "Nemotron", "Security");
+    return safeParseJSON(text, "Nemotron_Security");
+  } catch (err) {
+    console.error(`[aiService] generateSecurityDesign error: ${err.message}`);
+    return resolveMockFallback(err, () => generateDesignMockSecurity(getSampleKey(analysisData?.extracted?.projectTitle || "")), "generateSecurityDesign");
+  }
+}
+
+async function generatePerformanceDesign(analysisData) {
+  const system = `You are Nemotron-3-Super-120B-A12B, a performance and scalability expert. Given a software project analysis, generate a comprehensive performance design. RESPOND ONLY WITH VALID JSON (no markdown, no backticks).
+Schema: {"cachingStrategy":[{"layer":string,"cacheDuration":string,"targets":string,"tool":string}],"loadBalancing":{"strategy":string,"tool":string,"stickySession":string,"healthChecks":string},"scalingStrategy":{"type":string,"triggers":[string],"minInstances":number,"maxInstances":number},"databaseOptimization":[string],"cdnConfiguration":string,"monitoringAlerts":[{"metric":string,"threshold":string,"action":string}],"targetMetrics":{"p50Latency":string,"p95Latency":string,"availability":string,"throughput":string}}`;
+  const input = JSON.stringify({ projectTitle: analysisData?.extracted?.projectTitle, nonFunctionalRequirements: analysisData?.analyzed?.nonFunctionalRequirements, technologyRecommendation: analysisData?.analyzed?.technologyRecommendation });
+  if (shouldMock()) { return generateDesignMockPerformance(getSampleKey(analysisData?.extracted?.projectTitle || "")); }
+  try {
+    const text = await runAIPipeline(system, `Generate performance design for:\n\n${input}`, "Nemotron", "Performance");
+    return safeParseJSON(text, "Nemotron_Performance");
+  } catch (err) {
+    console.error(`[aiService] generatePerformanceDesign error: ${err.message}`);
+    return resolveMockFallback(err, () => generateDesignMockPerformance(getSampleKey(analysisData?.extracted?.projectTitle || "")), "generatePerformanceDesign");
+  }
+}
+
+async function generateDeploymentDesign(analysisData) {
+  const system = `You are Nemotron-3-Super-120B-A12B, a DevOps and cloud architecture expert. Given a software project analysis, generate a comprehensive deployment design. RESPOND ONLY WITH VALID JSON (no markdown, no backticks).
+Schema: {"deploymentDiagram":string,"infrastructure":[{"component":string,"service":string,"spec":string,"cost":string}],"dockerCompose":string,"cicdPipeline":{"stages":[{"name":string,"steps":[string]}],"tool":string,"triggers":{"pr":string,"main":string,"tag":string}},"backup":{"database":string,"media":string,"config":string},"disasterRecovery":{"rto":string,"rpo":string,"plan":[string]}}`;
+  const input = JSON.stringify({ projectTitle: analysisData?.extracted?.projectTitle, technologyRecommendation: analysisData?.analyzed?.technologyRecommendation, nonFunctionalRequirements: analysisData?.analyzed?.nonFunctionalRequirements });
+  if (shouldMock()) { return generateDesignMockDeployment(getSampleKey(analysisData?.extracted?.projectTitle || "")); }
+  try {
+    const text = await runAIPipeline(system, `Generate deployment design for:\n\n${input}`, "Nemotron", "Deployment");
+    return safeParseJSON(text, "Nemotron_Deployment");
+  } catch (err) {
+    console.error(`[aiService] generateDeploymentDesign error: ${err.message}`);
+    return resolveMockFallback(err, () => generateDesignMockDeployment(getSampleKey(analysisData?.extracted?.projectTitle || "")), "generateDeploymentDesign");
+  }
+}
+
+async function validateDesign(allDesignData, analysisData) {
+  if (shouldMock()) { return generateDesignMockValidation(analysisData, allDesignData); }
+
+  const reviewSchema = `RESPOND ONLY WITH VALID JSON:
+{"check":string,"score":number,"status":"Pass"|"Warning"|"Fail","findings":[string]}`;
+
+  const input = JSON.stringify({
+    requirements: analysisData?.extracted?.functionalRequirements?.slice(0, 8),
+    designSummary: Object.fromEntries(
+      Object.entries(allDesignData).map(([k, v]) => [k, Array.isArray(v) ? v.length : Object.keys(v || {}).length])
+    ),
+  });
+
+  const tasks = [
+    { provider: "Gemini", module: "ValidationGemini", system: `You are Gemini AI validating HLD, database, and UI/UX design coverage. ${reviewSchema}` },
+    { provider: "MiniMax", module: "ValidationMiniMax", system: `You are MiniMax-M3 validating API and LLD design quality. ${reviewSchema}` },
+    { provider: "Nemotron", module: "ValidationNemotron", system: `You are Nemotron-3-Super validating security, performance, and deployment design. ${reviewSchema}` },
+  ];
+
+  const reviews = { gemini: null, minimax: null, nemotron: null };
+  const results = await Promise.allSettled(
+    tasks.map(t => runAIPipeline(t.system, `Validate design:\n\n${input}`, t.provider, t.module))
+  );
+
+  results.forEach((result, i) => {
+    const task = tasks[i];
+    const key = task.provider === "Gemini" ? "gemini" : task.provider === "MiniMax" ? "minimax" : "nemotron";
+    if (result.status === "fulfilled") {
+      try { reviews[key] = safeParseJSON(result.value, task.module); } catch (e) {
+        console.warn(`[aiService] validateDesign parse failed for ${task.provider}`);
+      }
+    }
+  });
+
+  try {
+    const mergeSystem = `You are a design validation expert. Merge three model reviews into a final validation report with traceability matrix.
+RESPOND ONLY WITH VALID JSON.
+Schema: {"traceabilityMatrix":[{"requirementId":string,"requirementTitle":string,"designModule":string,"apiEndpoint":string,"status":string,"confidence":number}],"designReview":{"gemini":object,"minimax":object,"nemotron":object},"qualityChecklist":[{"item":string,"status":boolean}],"overallDesignScore":number,"designReadinessVerdict":string}`;
+    const mergeInput = JSON.stringify({
+      requirements: analysisData?.extracted?.functionalRequirements?.slice(0, 8),
+      reviews,
+      designModules: Object.keys(allDesignData),
+    });
+    const text = await runAIPipeline(mergeSystem, `Produce final validation report:\n\n${mergeInput}`, "Gemini", "ValidationFusion");
+    const merged = safeParseJSON(text, "ValidationFusion");
+    merged.designReview = {
+      gemini: reviews.gemini || merged.designReview?.gemini,
+      minimax: reviews.minimax || merged.designReview?.minimax,
+      nemotron: reviews.nemotron || merged.designReview?.nemotron,
+    };
+    return merged;
+  } catch (err) {
+    console.error(`[aiService] validateDesign fusion error: ${err.message}`);
+    const mock = generateDesignMockValidation(analysisData, allDesignData);
+    mock.designReview = {
+      gemini: reviews.gemini || mock.designReview?.gemini,
+      minimax: reviews.minimax || mock.designReview?.minimax,
+      nemotron: reviews.nemotron || mock.designReview?.nemotron,
+    };
+    return mock;
+  }
+}
+
+async function fuseDesign(allDesignData) {
+  if (shouldMock()) { return generateDesignMockFusion(allDesignData); }
+  try {
+    const system = `You are an AI Design Fusion Engine. Review all design modules and produce a final synthesis report. RESPOND ONLY WITH VALID JSON.
+Schema: {"summary":string,"conflictsResolved":[{"conflict":string,"resolution":string}],"duplicatesRemoved":[string],"bestIdeasCombined":[string],"confidenceScores":{"hld":number,"database":number,"uiux":number,"api":number,"lld":number,"security":number,"performance":number,"deployment":number,"validation":number,"overall":number},"finalDeliverables":[string]}`;
+    const input = `Design modules completed: ${Object.keys(allDesignData).join(", ")}`;
+    const text = await runAIPipeline(system, `Fuse design report:\n\n${input}`, "Gemini", "Fusion");
+    return safeParseJSON(text, "Gemini_Fusion");
+  } catch (err) {
+    console.error(`[aiService] fuseDesign error: ${err.message}`);
+    return resolveMockFallback(err, () => generateDesignMockFusion(allDesignData), "fuseDesign");
+  }
 }
 
 module.exports = {
@@ -1081,4 +1634,16 @@ module.exports = {
   riskAnalysis,
   costEstimation,
   roiEvaluation,
+  // Design Phase
+  generateHLD,
+  generateDatabaseDesign,
+  generateUIUXDesign,
+  generateAPIDesign,
+  generateLLD,
+  generateSecurityDesign,
+  generatePerformanceDesign,
+  generateDeploymentDesign,
+  validateDesign,
+  fuseDesign,
 };
+

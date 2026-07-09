@@ -4,6 +4,7 @@
 
 let analysisData = {};
 let currentTab = 'overview';
+let currentDesignSessionId = null; // Stored after Analysis completes
 
 // ── Navigation ────────────────────────────────────────────
 document.getElementById('navPills').addEventListener('click', e => {
@@ -13,7 +14,9 @@ document.getElementById('navPills').addEventListener('click', e => {
   pill.classList.add('active');
   const view = pill.dataset.view;
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-  document.getElementById(view === 'input' ? 'viewInput' : 'viewResults').classList.add('active');
+  if (view === 'input') document.getElementById('viewInput').classList.add('active');
+  else if (view === 'results') document.getElementById('viewResults').classList.add('active');
+  else if (view === 'design') document.getElementById('viewDesign').classList.add('active');
 });
 
 document.getElementById('sidebarNav').addEventListener('click', e => {
@@ -88,7 +91,16 @@ function startAnalysis() {
       case 7: analysisData.cost = d.data; break;
       case 8: analysisData.roi = d.data; break;
       case 9: analysisData.aiDashboard = d.data; break;
+      case 10: analysisData.report = d.data; break;
     }
+  });
+
+  es.addEventListener('orchestrator_metrics', e => {
+    try {
+      const metrics = JSON.parse(e.data);
+      analysisData.orchestrator = analysisData.orchestrator || {};
+      analysisData.orchestrator.modelMetrics = metrics;
+    } catch {}
   });
 
   es.addEventListener('complete', e => {
@@ -96,6 +108,18 @@ function startAnalysis() {
     document.getElementById('analyzeBtn').disabled = false;
     const d = JSON.parse(e.data);
     analysisData = d.modules;
+    // Store session ID for Design Phase
+    currentDesignSessionId = d.sessionId;
+    try { sessionStorage.setItem('sdlc_session_id', d.sessionId); } catch {}
+    // Enable Design Phase button
+    const designBtn = document.getElementById('generateDesignBtn');
+    if (designBtn) {
+      designBtn.disabled = false;
+      designBtn.style.display = 'flex';
+    }
+    // Enable Design nav pill
+    const designPill = document.getElementById('navDesign');
+    if (designPill) designPill.removeAttribute('disabled');
     buildResultsView();
     switchToResults();
   });
@@ -112,7 +136,7 @@ function startAnalysis() {
 // ── Build Results ─────────────────────────────────────────
 function buildResultsView() {
   const content = document.getElementById('resultsContent');
-  const { orchestrator, extracted, analyzed, validated, srs, feasibility, risks, cost, roi, aiDashboard } = analysisData;
+  const { orchestrator, extracted, analyzed, validated, srs, feasibility, risks, cost, roi, aiDashboard, report } = analysisData;
 
   content.innerHTML = [
     renderOverview(analysisData),
@@ -126,6 +150,7 @@ function buildResultsView() {
     renderCost(cost || {}),
     renderROI(roi || {}),
     renderAIComparison(aiDashboard || { scores: {} }),
+    renderReport(report || ''),
     renderRaw(analysisData || {}),
   ].join('');
 
@@ -150,6 +175,25 @@ function resetAnalysis() {
   document.getElementById('analyzeBtn').disabled = false;
   window.scrollTo({ top: 0 });
 }
+
+function downloadReportMarkdown() {
+  const md = analysisData?.report;
+  if (!md) { alert('No report available.'); return; }
+  const blob = new Blob([md], { type: 'text/markdown' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `sdlc-analysis-report-${Date.now()}.md`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// Restore session from previous analysis run
+document.addEventListener('DOMContentLoaded', () => {
+  try {
+    const saved = sessionStorage.getItem('sdlc_session_id');
+    if (saved) currentDesignSessionId = saved;
+  } catch {}
+});
 
 function exportToPDF() {
   if (!analysisData || !analysisData.extracted) {

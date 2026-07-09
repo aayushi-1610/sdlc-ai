@@ -3,7 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SDLC Analysis Platform – AI Orchestrated</title>
+  <title>SDLC·AI Platform – AI-Orchestrated Analysis & Design</title>
+  <meta name="description" content="End-to-end AI-orchestrated SDLC platform. Analysis Phase to Design Phase powered by Gemini, MiniMax-M3, and Nemotron." />
   <link rel="stylesheet" href="/css/style.css" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
@@ -20,10 +21,11 @@
     <nav class="nav-pills" id="navPills">
       <span class="nav-pill active" data-view="input">Analyze</span>
       <span class="nav-pill" data-view="results" id="navResults">Results</span>
+      <span class="nav-pill design-pill" data-view="design" id="navDesign" disabled title="Run Analysis first">Design Phase</span>
     </nav>
     <div class="header-badge">
       <span class="badge-dot"></span>
-      <span>Multi-Model Orchestration</span>
+      <span>Analysis → Design · SDLC Pipeline</span>
     </div>
   </div>
 </header>
@@ -32,13 +34,13 @@
 <main id="viewInput" class="view active">
 
   <section class="hero">
-    <div class="hero-tag">SDLC Analysis Phase Automation</div>
-    <h1 class="hero-title">Requirements In,<br><em>Architecture Out.</em></h1>
-    <p class="hero-sub">Paste your client brief. Three specialized AI models orchestrate a full Software Requirements Specification, Feasibility Study, Risk Assessment, and ROI in under two minutes.</p>
+    <div class="hero-tag">AI-Orchestrated SDLC · Analysis Phase → Design Phase</div>
+    <h1 class="hero-title">Requirements In,<br><em>Full Blueprint Out.</em></h1>
+    <p class="hero-sub">Paste your client brief. Three specialized AI models orchestrate a full Software Requirements Specification, Feasibility Study, Risk Assessment, ROI — then automatically generate a complete Design Document.</p>
     <div class="model-pills">
-      <span class="mpill gemini">Gemini · Elicitation & Enhancement</span>
-      <span class="mpill minimax">MiniMax-M3 · Validation</span>
-      <span class="mpill nemotron">Nemotron-3-Super-120B-A12B · Feasibility, Risks & Cost</span>
+      <span class="mpill gemini">Gemini · Elicitation, HLD, DB, UI/UX</span>
+      <span class="mpill minimax">MiniMax-M3 · Validation, API, LLD</span>
+      <span class="mpill nemotron">Nemotron-3-Super · Feasibility, Security, Deployment</span>
     </div>
   </section>
 
@@ -85,13 +87,14 @@
         <div class="ps" data-step="7">Cost</div>
         <div class="ps" data-step="8">ROI</div>
         <div class="ps" data-step="9">Dashboard</div>
+        <div class="ps" data-step="10">Report</div>
       </div>
     </div>
   </section>
 
 </main>
 
-<!-- ═══════════════ RESULTS VIEW ═══════════════ -->
+<!-- ═══════════════ ANALYSIS RESULTS VIEW ═══════════════ -->
 <div id="viewResults" class="view">
 
   <div class="results-layout">
@@ -110,9 +113,14 @@
         <a class="snav-item" data-tab="risk">⑥ Risk Analysis</a>
         <a class="snav-item" data-tab="cost">⑦ Cost Estimation</a>
         <a class="snav-item" data-tab="roi">⑧ ROI Evaluation</a>
-        <a class="snav-item" data-tab="raw">⑩ Raw Output</a>
+        <a class="snav-item" data-tab="aicomp">⑨ AI Comparison</a>
+        <a class="snav-item" data-tab="report">⑩ Analysis Report</a>
+        <a class="snav-item" data-tab="raw">⑪ Raw Output</a>
       </nav>
-      <button class="btn-pdf" id="exportPdfBtn" onclick="exportToPDF()">⤓ Export Report PDF</button>
+      <button class="btn-generate-design" id="generateDesignBtn" style="display:none" disabled onclick="startDesignPhase(currentDesignSessionId)">
+        🎨 Generate Design Phase
+      </button>
+      <button class="btn-pdf" id="exportPdfBtn" onclick="exportToPDF()">⤓ Export Analysis PDF</button>
       <button class="btn-new" onclick="resetAnalysis()">+ New Analysis</button>
     </aside>
 
@@ -125,8 +133,84 @@
 
 </div>
 
+<!-- ═══════════════ DESIGN PHASE VIEW ═══════════════ -->
+<div id="viewDesign" class="view">
+
+  <!-- Design Progress (shown during generation) -->
+  <section class="design-progress-section" id="designProgressSection" style="display:none">
+    <div class="progress-card">
+      <div class="design-progress-badge">🎨 Design Phase Orchestrator</div>
+      <div class="progress-header">
+        <span class="progress-label" id="designProgressLabel">Initializing Design Phase…</span>
+        <span class="progress-model" id="designProgressModel"></span>
+        <span class="progress-pct" id="designProgressPct">0%</span>
+      </div>
+      <div class="progress-bar-track">
+        <div class="progress-bar-fill design-bar" id="designProgressBar"></div>
+      </div>
+      <div class="pipeline-steps design-pipeline" id="designPipelineSteps">
+        <div class="dps active">HLD</div>
+        <div class="dps">DB</div>
+        <div class="dps">UI/UX</div>
+        <div class="dps">API</div>
+        <div class="dps">LLD</div>
+        <div class="dps">Security</div>
+        <div class="dps">Perf.</div>
+        <div class="dps">Deploy</div>
+        <div class="dps">Validate</div>
+        <div class="dps">Fusion</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="results-layout">
+
+    <!-- Design Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-title">Design Modules</div>
+      <nav class="sidebar-nav" id="designSidebarNav">
+        <a class="design-snav-item active" data-tab="design-overview">◈ Design Overview</a>
+        <a class="design-snav-item" data-tab="design-hld">① High-Level Design</a>
+        <a class="design-snav-item" data-tab="design-database">② Database Design</a>
+        <a class="design-snav-item" data-tab="design-uiux">③ UI/UX Design</a>
+        <a class="design-snav-item" data-tab="design-api">④ API Design</a>
+        <a class="design-snav-item" data-tab="design-lld">⑤ Low-Level Design</a>
+        <a class="design-snav-item" data-tab="design-security">⑥ Security Design</a>
+        <a class="design-snav-item" data-tab="design-performance">⑦ Performance</a>
+        <a class="design-snav-item" data-tab="design-deployment">⑧ Deployment</a>
+        <a class="design-snav-item" data-tab="design-validation">⑨ Validation</a>
+        <a class="design-snav-item" data-tab="design-fusion">⑩ Fusion Engine</a>
+      </nav>
+      <button class="btn-pdf" onclick="exportDesignPDF()">⤓ Export Design PDF</button>
+      <button class="btn-new" onclick="resetToAnalysis()">← Back to Analysis</button>
+    </aside>
+
+    <!-- Design Content -->
+    <section class="results-content" id="designResultsContent">
+      <div class="design-placeholder">
+        <div class="design-placeholder-icon">🎨</div>
+        <div class="design-placeholder-title">Design Phase Ready</div>
+        <div class="design-placeholder-sub">Complete the Analysis Phase to unlock the AI Design Orchestrator. Then click "Generate Design Phase" in the Analysis sidebar.</div>
+      </div>
+    </section>
+
+  </div>
+
+</div>
+
 <script src="/js/samples.js"></script>
 <script src="/js/render.js"></script>
+<script src="/js/designRender.js"></script>
 <script src="/js/app.js"></script>
+<script src="/js/design.js"></script>
+<script>
+  function resetToAnalysis() {
+    document.querySelectorAll('.nav-pill').forEach(p => p.classList.remove('active'));
+    document.getElementById('navResults').classList.add('active');
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    document.getElementById('viewResults').classList.add('active');
+    window.scrollTo({ top: 0 });
+  }
+</script>
 </body>
 </html>

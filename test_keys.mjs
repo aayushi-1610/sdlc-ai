@@ -20,7 +20,7 @@ async function tryGeminiModels() {
       const res = await axios.post(url, {
         contents: [{ role: "user", parts: [{ text: 'Reply with exactly: {"status":"ok"}' }] }],
         generationConfig: { responseMimeType: "application/json" }
-      }, { headers: { "Content-Type": "application/json" }, timeout: 15000 });
+      }, { headers: { "Content-Type": "application/json" }, timeout: 600000 });
       console.log(`[Gemini] ✓ MODEL "${model}" WORKS! Response: ${res.data.candidates[0].content.parts[0].text.substring(0, 80)}`);
       return;
     } catch (e) {
@@ -50,7 +50,7 @@ async function tryHuggingFaceEndpoints() {
           model,
           messages: [{ role: "user", content: 'Reply with exactly: {"status":"ok"}' }],
           max_tokens: 50
-        }, { headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` }, timeout: 15000 });
+        }, { headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` }, timeout: 600000 });
         console.log(`[HuggingFace] ✓ ENDPOINT "${ep.name}" + MODEL "${model}" WORKS!`);
         console.log(`  Response: ${res.data.choices[0].message.content.substring(0, 80)}`);
         return;

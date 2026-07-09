@@ -1,5 +1,23 @@
 // server/services/orchestrator.js
 const axios = require("axios");
+const { parseAIJSON, isParseError, cleanJSONResponse } = require("../utils/jsonUtils");
+
+const DEFAULT_MODEL_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+
+function getModelTimeoutMs() {
+  const configured = Number(process.env.MODEL_TIMEOUT_MS);
+  return configured > 0 ? configured : DEFAULT_MODEL_TIMEOUT_MS;
+}
+
+function getMiniMaxTimeoutMs() {
+  const configured = Number(process.env.MINIMAX_TIMEOUT_MS);
+  return configured > 0 ? configured : 20 * 60 * 1000; // 20 minutes default for MiniMax
+}
+
+function getMiniMaxMaxRetries() {
+  const configured = Number(process.env.MINIMAX_MAX_RETRIES);
+  return configured > 0 ? configured : 5;
+}
 
 // ── Fallback Mocks Database ───────────────────────────────────
 const MOCKS = {
@@ -155,64 +173,170 @@ function getFallbackData(rawInput) {
   return generateDynamicElicitation(rawInput);
 }
 
-function cleanJSONResponse(text) {
-  if (!text) return "{}";
-  let cleaned = text.trim();
-  
-  // Extract content between ```json and ``` or ``` and ```
-  const jsonBlockRegex = /```json\s*([\s\S]*?)\s*```/;
-  const codeBlockRegex = /```\s*([\s\S]*?)\s*```/;
-  
-  let match = jsonBlockRegex.exec(cleaned) || codeBlockRegex.exec(cleaned);
-  if (match && match[1]) {
-    cleaned = match[1].trim();
-  } else {
-    // Fallback: extract substring between first '{' and last '}'
-    const firstBrace = cleaned.indexOf('{');
-    const lastBrace = cleaned.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-      cleaned = cleaned.substring(firstBrace, lastBrace + 1).trim();
-    }
-  }
-
-  // Fix repeated line end glitches: e.g. "title": "Some Heterogeneity",\n Heterogeneity", -> "title": "Some Heterogeneity",
-  cleaned = cleaned.replace(/(\b\w+",?)\s*\n\s*(?!")\1/g, '$1');
-
-  // Fix merged key-value strings: e.g. "name: Unauthenticated Visitor", -> "name": "Unauthenticated Visitor",
-  cleaned = cleaned.replace(/([{,]\s*)"([a-zA-Z0-9_$]+)\s*:\s*([^"]+)"/g, '$1"$2": "$3"');
-
-  // Fix double-colon value repetitions: e.g. "key": "val1": "val2" -> "key": "val1"
-  cleaned = cleaned.replace(/"([^"]+)"\s*:\s*"([^"]+)"\s*:\s*"[^"]*"/g, '"$1": "$2"');
-
-  // Safe conversion of single-quoted keys/values to double-quoted JSON
-  // Quote single-quoted keys: {'key': value} -> {"key": value}
-  cleaned = cleaned.replace(/([{,]\s*)'([a-zA-Z0-9_$]+)'\s*:/g, '$1"$2":');
-  // Quote single-quoted string values: {key: 'value'} -> {key: "value"}
-  cleaned = cleaned.replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, ': "$1"');
-  // Quote single-quoted array elements: ['value'] -> ["value"]
-  cleaned = cleaned.replace(/([\[,]\s*)'([^'\\]*(?:\\.[^'\\]*)*)'(?=\s*[,\]])/g, '$1"$2"');
-
-  // Quote unquoted string values (e.g. : MiniMax -> : "MiniMax" or : MR-1 -> : "MR-1")
-  cleaned = cleaned.replace(/:\s*(?!true|false|null|[0-9\-'"\[{])([a-zA-Z0-9_\-]+)(?=\s*(?:,\s*"|\s*}))/g, ': "$1"');
-
-  // Remove trailing commas that crash JSON.parse
-  cleaned = cleaned.replace(/,\s*}/g, '}');
-  cleaned = cleaned.replace(/,\s*]/g, ']');
-
-  // Remove comments
-  cleaned = cleaned.replace(/\/\*[\s\S]*?\*\//g, '');
-  cleaned = cleaned.replace(/(?:^|[^:])\/\/.*$/gm, '');
-
-  return cleaned.trim();
+function shouldSimulateOnError(err) {
+  return process.env.USE_MOCK_FALLBACK === "true" && !isParseError(err);
 }
 
-// ── Gemini Circuit Breaker ──────────────────────────────────
+// ── Key Routing Helpers ─────────────────────────────────────────
+// Each provider has 4 keys mapped to distinct modules across Analysis + Design phases.
+// Parallel batches (Design: HLD/DB/UIUX, API/LLD, Security/Perf/Deploy) use different keys.
+
+function normalizeModuleName(moduleName) {
+  return (moduleName || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+// Gemini KEY_1–4: Analysis (Orchestrator, Analyze, Cost) + Design (HLD, DB, UI/UX, Validation, Fusion)
+const GEMINI_KEY_BY_MODULE = {
+  orchestratorelicitation: 0, // Analysis: orchestrator elicitation
+  extract: 0,                 // Analysis: requirement extraction
+  fusionresponses: 0,         // Analysis: orchestrator response fusion
+  fusion: 0,                  // Design: design fusion engine
+  analyze: 1,                 // Analysis: requirement analysis
+  costgemini: 1,              // Analysis: cost estimation (Gemini)
+  uiux: 1,                    // Design: UI/UX design (parallel batch — distinct key from HLD/DB)
+  hld: 2,                     // Design: high-level design
+  validationgemini: 2,        // Design: validation (Gemini)
+  database: 3,                // Design: database design
+  validationfusion: 3,        // Design: validation merge
+};
+
+// MiniMax KEY_1–4: Analysis (Orchestrator, Validate, Risk, Cost) + Design (API, LLD, Validation)
+const MINIMAX_KEY_BY_MODULE = {
+  orchestratorvalidation: 0, // Analysis: orchestrator validation
+  validationminimax: 0,      // Design: validation (MiniMax)
+  validate: 1,               // Analysis: requirement validation
+  costminimax: 1,            // Analysis: cost estimation (MiniMax)
+  riskvalidate: 2,           // Analysis: risk validation
+  lld: 2,                    // Design: low-level design
+  api: 3,                    // Design: API design
+};
+
+// Nemotron KEY_1–4: Analysis (Orchestrator, Feasibility, Risk, Cost) + Design (Security, Perf, Deploy, Validation)
+const NEMOTRON_KEY_BY_MODULE = {
+  orchestratorelicitation: 0, // Analysis: orchestrator elicitation
+  orchestratornemotron: 0,    // Analysis: orchestrator elicitation (alias)
+  security: 0,                // Design: security design
+  analyzerecommendation: 1,   // Analysis: stack recommendation
+  performance: 1,             // Design: performance design
+  feasibility: 2,             // Analysis: feasibility study
+  deployment: 2,              // Design: deployment design
+  riskidentify: 3,            // Analysis: risk identification
+  costnemotron: 3,            // Analysis: cost estimation (Nemotron)
+  validationnemotron: 3,      // Design: validation (Nemotron)
+};
+
+function lookupKeyIndex(moduleName, keyMap) {
+  const normalized = normalizeModuleName(moduleName);
+  if (keyMap[normalized] !== undefined) return keyMap[normalized];
+  // Fallback: hash module name across available keys for unknown modules
+  let hash = 0;
+  for (let i = 0; i < normalized.length; i++) {
+    hash = (hash + normalized.charCodeAt(i)) % 4;
+  }
+  return hash;
+}
+
+function getAllGeminiKeys() {
+  const keys = [];
+  for (let i = 1; i <= 10; i++) {
+    const key = process.env[`GEMINI_API_KEY_${i}`];
+    if (key) keys.push(key);
+  }
+  if (keys.length === 0 && process.env.GEMINI_API_KEY) {
+    keys.push(process.env.GEMINI_API_KEY);
+  }
+  return keys;
+}
+
+function getGeminiKeyIndex(moduleName) {
+  return lookupKeyIndex(moduleName, GEMINI_KEY_BY_MODULE);
+}
+
+function getGeminiApiKey(moduleName) {
+  const keys = getAllGeminiKeys();
+  if (keys.length === 0) return "";
+
+  const keyIndex = getGeminiKeyIndex(moduleName) % keys.length;
+  console.log(`[orchestrator] Routed Gemini key (index ${keyIndex}/${keys.length}) for module "${moduleName || "Unknown"}"`);
+  return keys[keyIndex];
+}
+
+function getOrderedGeminiKeys(moduleName) {
+  const keys = getAllGeminiKeys();
+  if (keys.length === 0) return [];
+
+  const startIndex = getGeminiKeyIndex(moduleName) % keys.length;
+  return [...keys.slice(startIndex), ...keys.slice(0, startIndex)];
+}
+
+function getAllMiniMaxKeys() {
+  const keys = [];
+  for (let i = 1; i <= 10; i++) {
+    const key = process.env[`MINIMAX_API_KEY_${i}`];
+    if (key) keys.push(key);
+  }
+  if (keys.length === 0 && process.env.MINIMAX_API_KEY) {
+    keys.push(process.env.MINIMAX_API_KEY);
+  }
+  return keys;
+}
+
+function getMiniMaxKeyIndex(moduleName) {
+  return lookupKeyIndex(moduleName, MINIMAX_KEY_BY_MODULE);
+}
+
+function getMiniMaxApiKey(moduleName) {
+  const keys = getAllMiniMaxKeys();
+  if (keys.length === 0) return process.env.NIM_API_KEY || "";
+  const keyIndex = getMiniMaxKeyIndex(moduleName) % keys.length;
+  console.log(`[orchestrator] Routed MiniMax key (index ${keyIndex}/${keys.length}) for module "${moduleName || "Unknown"}"`);
+  return keys[keyIndex];
+}
+
+function getOrderedMiniMaxKeys(moduleName) {
+  const keys = getAllMiniMaxKeys();
+  if (keys.length === 0) return [];
+  const startIndex = getMiniMaxKeyIndex(moduleName) % keys.length;
+  return [...keys.slice(startIndex), ...keys.slice(0, startIndex)];
+}
+
+function getAllNemotronKeys() {
+  const keys = [];
+  for (let i = 1; i <= 10; i++) {
+    const key = process.env[`NIM_API_KEY_${i}`];
+    if (key) keys.push(key);
+  }
+  if (keys.length === 0 && process.env.NIM_API_KEY) {
+    keys.push(process.env.NIM_API_KEY);
+  }
+  return keys;
+}
+
+function getNemotronKeyIndex(moduleName) {
+  return lookupKeyIndex(moduleName, NEMOTRON_KEY_BY_MODULE);
+}
+
+function getNemotronApiKey(moduleName) {
+  const keys = getAllNemotronKeys();
+  if (keys.length === 0) return "";
+  const keyIndex = getNemotronKeyIndex(moduleName) % keys.length;
+  console.log(`[orchestrator] Routed Nemotron key (index ${keyIndex}/${keys.length}) for module "${moduleName || "Unknown"}"`);
+  return keys[keyIndex];
+}
+
+function getOrderedNemotronKeys(moduleName) {
+  const keys = getAllNemotronKeys();
+  if (keys.length === 0) return [];
+  const startIndex = getNemotronKeyIndex(moduleName) % keys.length;
+  return [...keys.slice(startIndex), ...keys.slice(0, startIndex)];
+}
+
 let geminiCooldownUntil = 0; // timestamp ms; 0 = not cooling down
 const GEMINI_COOLDOWN_MS = 90 * 1000; // 90 seconds
 
-async function callGeminiDirect(systemPrompt, userPrompt) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
+async function callGeminiDirect(systemPrompt, userPrompt, moduleName) {
+  const apiKeys = getOrderedGeminiKeys(moduleName);
+  if (apiKeys.length === 0) {
     throw new Error("GEMINI_API_KEY is not configured");
   }
 
@@ -231,44 +355,53 @@ async function callGeminiDirect(systemPrompt, userPrompt) {
 
   let lastError = null;
   let quotaFailures = 0;
-  for (const model of models) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-      const payload = {
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: `${systemPrompt}\n\nUser Request/Input:\n${userPrompt}` }]
-          }
-        ]
-      };
 
-      if (systemPrompt.toLowerCase().includes("json") || userPrompt.toLowerCase().includes("json")) {
-        payload.generationConfig = { responseMimeType: "application/json" };
-      }
+  for (let keyIdx = 0; keyIdx < apiKeys.length; keyIdx++) {
+    const apiKey = apiKeys[keyIdx];
+    if (keyIdx > 0) {
+      console.warn(`[orchestrator] Gemini key fallback — trying key ${keyIdx + 1}/${apiKeys.length}`);
+    }
 
-      const res = await axios.post(url, payload, {
-        headers: { "Content-Type": "application/json" }
-      });
+    for (const model of models) {
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+        const payload = {
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: `${systemPrompt}\n\nUser Request/Input:\n${userPrompt}` }]
+            }
+          ]
+        };
 
-      const text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (text) {
-        return text;
-      }
-    } catch (e) {
-      lastError = e;
-      const msg = e.response?.data?.error?.message || e.message;
-      console.warn(`[orchestrator] Gemini fallback warning for ${model}: ${msg}`);
-      // Count quota exhaustion AND unavailable/deprecated model errors
-      if (msg && (
-        msg.includes('Quota exceeded') ||
-        msg.includes('quota') ||
-        msg.includes('RESOURCE_EXHAUSTED') ||
-        msg.includes('is not found') ||
-        msg.includes('not supported') ||
-        msg.includes('high demand')
-      )) {
-        quotaFailures++;
+        if (systemPrompt.toLowerCase().includes("json") || userPrompt.toLowerCase().includes("json")) {
+          payload.generationConfig = { responseMimeType: "application/json" };
+        }
+
+        const res = await axios.post(url, payload, {
+          headers: { "Content-Type": "application/json" },
+          timeout: getModelTimeoutMs()
+        });
+
+        const text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (text) {
+          return text;
+        }
+      } catch (e) {
+        lastError = e;
+        const msg = e.response?.data?.error?.message || e.message;
+        console.warn(`[orchestrator] Gemini fallback warning (key ${keyIdx + 1}, ${model}): ${msg}`);
+        if (msg && (
+          msg.includes('Quota exceeded') ||
+          msg.includes('quota') ||
+          msg.includes('RESOURCE_EXHAUSTED') ||
+          msg.includes('is not found') ||
+          msg.includes('not supported') ||
+          msg.includes('high demand')
+        )) {
+          quotaFailures++;
+          break; // try next API key
+        }
       }
     }
   }
@@ -276,69 +409,102 @@ async function callGeminiDirect(systemPrompt, userPrompt) {
   // Trip the breaker if 2+ models failed with quota/unavailable errors
   if (quotaFailures >= 2) {
     geminiCooldownUntil = Date.now() + GEMINI_COOLDOWN_MS;
-    console.warn(`[orchestrator] Gemini circuit breaker TRIPPED (${quotaFailures}/${models.length} models quota/unavailable). Cooling down for ${GEMINI_COOLDOWN_MS / 1000}s.`);
+    console.warn(`[orchestrator] Gemini circuit breaker TRIPPED (${quotaFailures} quota failures). Cooling down for ${GEMINI_COOLDOWN_MS / 1000}s.`);
   }
 
   throw new Error(`Gemini API execution failed: ${lastError?.message || "Unknown error"}`);
 }
 
-async function callMiniMaxNIM(systemPrompt, userPrompt) {
-  const apiKey = process.env.MINIMAX_API_KEY || process.env.NIM_API_KEY;
-  if (!apiKey) {
+async function callMiniMaxNIM(systemPrompt, userPrompt, moduleName) {
+  const apiKeys = getOrderedMiniMaxKeys(moduleName);
+  if (apiKeys.length === 0) {
     throw new Error("NIM_API_KEY or MINIMAX_API_KEY is not configured");
   }
 
   const url = `${process.env.NIM_BASE_URL || "https://integrate.api.nvidia.com/v1"}/chat/completions`;
-  
-  // Try minimax-m3 first
-  try {
-    const payload = {
-      model: "minimaxai/minimax-m3",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt }
-      ],
-      temperature: 0.1,
-      max_tokens: 8192
-    };
-    const res = await postWithRetry(url, payload, {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    });
-    return res.data?.choices?.[0]?.message?.content;
-  } catch (e) {
-    console.warn(`[orchestrator] MiniMax M3 failed, trying MiniMax M2.7... error: ${e.message}`);
-    // Fallback to minimax-m2.7 (combines prompts since minimax-m2.7 does not support system role)
-    const payload = {
-      model: "minimaxai/minimax-m2.7",
-      messages: [
-        { role: "user", content: `${systemPrompt}\n\n${userPrompt}` }
-      ],
-      temperature: 0.1,
-      max_tokens: 8192
-    };
-    const res = await postWithRetry(url, payload, {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    });
-    return res.data?.choices?.[0]?.message?.content;
+  let lastError = null;
+
+  for (let keyIdx = 0; keyIdx < apiKeys.length; keyIdx++) {
+    const apiKey = apiKeys[keyIdx];
+    if (keyIdx > 0) {
+      console.warn(`[orchestrator] MiniMax key fallback — trying key ${keyIdx + 1}/${apiKeys.length}`);
+    }
+
+    try {
+      const payload = {
+        model: "minimaxai/minimax-m3",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt }
+        ],
+        temperature: 0.1,
+        max_tokens: 8192
+      };
+      const res = await postWithRetry(url, payload, {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      }, getMiniMaxMaxRetries(), getMiniMaxTimeoutMs());
+      return res.data?.choices?.[0]?.message?.content;
+    } catch (e) {
+      lastError = e;
+      const isHardFailure = e.response?.status === 504 || e.code === 'ECONNRESET';
+      if (isHardFailure) {
+        console.warn(`[orchestrator] MiniMax M3 hard failure (key ${keyIdx + 1}): ${e.message}. Falling back to Gemini/Nemotron.`);
+        throw e;
+      }
+      console.warn(`[orchestrator] MiniMax M3 failed (key ${keyIdx + 1}), trying M2.7... error: ${e.message}`);
+      try {
+        const payload = {
+          model: "minimaxai/minimax-m2.7",
+          messages: [
+            { role: "user", content: `${systemPrompt}\n\n${userPrompt}` }
+          ],
+          temperature: 0.1,
+          max_tokens: 8192
+        };
+        const res = await postWithRetry(url, payload, {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        }, getMiniMaxMaxRetries(), getMiniMaxTimeoutMs());
+        return res.data?.choices?.[0]?.message?.content;
+      } catch (e2) {
+        lastError = e2;
+        const isHardFailure = e2.response?.status === 504 || e2.code === 'ECONNRESET';
+        if (isHardFailure) {
+          console.warn(`[orchestrator] MiniMax M2.7 hard failure (key ${keyIdx + 1}): ${e2.message}. Falling back to Gemini/Nemotron.`);
+          throw e2;
+        }
+        const msg = e2.response?.data?.error?.message || e2.message;
+        if (msg && (msg.includes("429") || msg.includes("rate") || msg.includes("quota") || msg.includes("limit"))) {
+          continue; // try next API key
+        }
+      }
+    }
   }
+
+  throw new Error(`MiniMax NIM API execution failed: ${lastError?.message || "Unknown error"}`);
 }
 
-async function postWithRetry(url, payload, headers, attempts = 5) {
+async function postWithRetry(url, payload, headers, attempts = 5, timeoutMs = 10 * 60 * 1000) {
   const delay = ms => new Promise(res => setTimeout(res, ms));
   for (let i = 0; i < attempts; i++) {
     try {
-      return await axios.post(url, payload, { headers });
+      return await axios.post(url, payload, { headers, timeout: timeoutMs });
     } catch (e) {
-      const isRetriable = 
+      const status = e.response?.status;
+      if (status === 504) {
+        console.warn(`[orchestrator] Post request failed with status 504, not retrying further.`);
+        throw e;
+      }
+
+      const isRetriable =
         !e.response || // Network error (no response)
-        e.response.status >= 500 || // Server errors (500, 502, 503, 504)
-        e.response.status === 429 || // Rate limits
+        (status >= 500 && status !== 504) || // Server errors except 504
+        status === 429 || // Rate limits
         e.code === 'ECONNRESET';
 
       if (isRetriable && i < attempts - 1) {
-        const statusText = e.response ? `status ${e.response.status}` : (e.code || e.message);
+        const statusText = e.response ? `status ${status}` : (e.code || e.message);
         console.warn(`[orchestrator] Post request failed with ${statusText}, retrying ${i + 1}/${attempts} in ${Math.pow(2, i)}s...`);
         await delay(1000 * Math.pow(2, i));
         continue;
@@ -348,9 +514,9 @@ async function postWithRetry(url, payload, headers, attempts = 5) {
   }
 }
 
-async function callNemotronNIM(systemPrompt, userPrompt) {
-  const apiKey = process.env.NIM_API_KEY;
-  if (!apiKey) {
+async function callNemotronNIM(systemPrompt, userPrompt, moduleName) {
+  const apiKeys = getOrderedNemotronKeys(moduleName);
+  if (apiKeys.length === 0) {
     throw new Error("NIM_API_KEY is not configured");
   }
 
@@ -365,55 +531,73 @@ async function callNemotronNIM(systemPrompt, userPrompt) {
     max_tokens: 4096
   };
 
-  try {
-    const res = await postWithRetry(url, payload, {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    });
-    return res.data?.choices?.[0]?.message?.content;
-  } catch (e) {
-    const msg = e.response?.data?.error?.message || e.message;
-    throw new Error(`Nemotron NIM API execution failed: ${msg}`);
-  }
-}
-
-async function runModel(systemPrompt, userPrompt, provider) {
-  console.log(`[orchestrator] runModel: calling provider="${provider}"`);
-
-  if (provider === "Gemini") {
-    try {
-      return await callGeminiDirect(systemPrompt, userPrompt);
-    } catch (e) {
-      console.warn(`[orchestrator] Gemini failed, falling back to Nemotron: ${e.message}`);
-      return await callNemotronNIM(systemPrompt, userPrompt);
+  let lastError = null;
+  for (let keyIdx = 0; keyIdx < apiKeys.length; keyIdx++) {
+    const apiKey = apiKeys[keyIdx];
+    if (keyIdx > 0) {
+      console.warn(`[orchestrator] Nemotron key fallback — trying key ${keyIdx + 1}/${apiKeys.length}`);
     }
-  } else if (provider === "MiniMax") {
     try {
-      return await callMiniMaxNIM(systemPrompt, userPrompt);
+      const res = await postWithRetry(url, payload, {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      });
+      return res.data?.choices?.[0]?.message?.content;
     } catch (e) {
-      console.warn(`[orchestrator] MiniMax failed, falling back to Gemini: ${e.message}`);
-      try {
-        return await callGeminiDirect(systemPrompt, userPrompt);
-      } catch (geminiErr) {
-        console.warn(`[orchestrator] Gemini fallback failed, trying Nemotron: ${geminiErr.message}`);
-        return await callNemotronNIM(systemPrompt, userPrompt);
+      lastError = e;
+      const msg = e.response?.data?.error?.message || e.message;
+      console.warn(`[orchestrator] Nemotron failed (key ${keyIdx + 1}): ${msg}`);
+      if (msg && (msg.includes("429") || msg.includes("rate") || msg.includes("quota") || msg.includes("limit") || msg.includes("401") || msg.includes("403"))) {
+        continue;
       }
     }
-  } else if (provider === "Nemotron") {
-    try {
-      return await callNemotronNIM(systemPrompt, userPrompt);
-    } catch (e) {
-      console.warn(`[orchestrator] Nemotron failed, falling back to Gemini: ${e.message}`);
-      return await callGeminiDirect(systemPrompt, userPrompt);
-    }
-  } else {
-    if (process.env.GEMINI_API_KEY) {
-      return await callGeminiDirect(systemPrompt, userPrompt);
-    } else if (process.env.NIM_API_KEY) {
-      return await callNemotronNIM(systemPrompt, userPrompt);
-    }
-    throw new Error(`Unsupported model provider requested: ${provider}`);
   }
+
+  throw new Error(`Nemotron NIM API execution failed: ${lastError?.message || "Unknown error"}`);
+}
+
+async function runModel(systemPrompt, userPrompt, provider, moduleName) {
+  const timeoutMs = provider === "MiniMax" ? getMiniMaxTimeoutMs() : getModelTimeoutMs();
+  console.log(`[orchestrator] runModel: calling provider="${provider}" moduleName="${moduleName || "Unknown"}" (timeout ${timeoutMs / 1000}s)`);
+
+  const execute = async () => {
+    if (provider === "Gemini") {
+      try {
+        return await callGeminiDirect(systemPrompt, userPrompt, moduleName);
+      } catch (e) {
+        console.warn(`[orchestrator] Gemini failed, falling back to Nemotron: ${e.message}`);
+        return await callNemotronNIM(systemPrompt, userPrompt, moduleName);
+      }
+    } else if (provider === "MiniMax") {
+      try {
+        return await callMiniMaxNIM(systemPrompt, userPrompt, moduleName);
+      } catch (e) {
+        console.warn(`[orchestrator] MiniMax failed, falling back to Gemini: ${e.message}`);
+        try {
+          return await callGeminiDirect(systemPrompt, userPrompt, moduleName);
+        } catch (geminiErr) {
+          console.warn(`[orchestrator] Gemini fallback failed, trying Nemotron: ${geminiErr.message}`);
+          return await callNemotronNIM(systemPrompt, userPrompt, moduleName);
+        }
+      }
+    } else if (provider === "Nemotron") {
+      try {
+        return await callNemotronNIM(systemPrompt, userPrompt, moduleName);
+      } catch (e) {
+        console.warn(`[orchestrator] Nemotron failed, falling back to Gemini: ${e.message}`);
+        return await callGeminiDirect(systemPrompt, userPrompt, moduleName);
+      }
+    } else {
+      if (getGeminiApiKey(moduleName)) {
+        return await callGeminiDirect(systemPrompt, userPrompt, moduleName);
+      } else if (process.env.NIM_API_KEY) {
+        return await callNemotronNIM(systemPrompt, userPrompt, moduleName);
+      }
+      throw new Error(`Unsupported model provider requested: ${provider}`);
+    }
+  };
+
+  return withTimeout(execute(), timeoutMs, `${provider}:${moduleName || "Unknown"}`);
 }
 
 // ── Timeout Decorator ──────────────────────────────────────────
@@ -442,7 +626,7 @@ function scoreResponse(result, elapsedMs, provider) {
 
   // 1. JSON parsed successfully (+20)
   try {
-    parsed = typeof result === "object" ? result : JSON.parse(cleanJSONResponse(result));
+    parsed = typeof result === "object" ? result : parseAIJSON(result, "scoreResponse");
     scoreBreakdown.json = 20;
   } catch (e) {
     scoreBreakdown.json = 0;
@@ -553,15 +737,15 @@ ${JSON.stringify(successfulOutputs, null, 2)}
 Please merge and fuse them into a single coherent JSON object following the schema.`;
 
   try {
-    const fusedText = await callGeminiDirect(fusionSystem, fusionUser);
-    const parsedFused = JSON.parse(cleanJSONResponse(fusedText));
+    const fusedText = await callGeminiDirect(fusionSystem, fusionUser, "FusionResponses");
+    const parsedFused = parseAIJSON(fusedText, "FusionResponses");
     return parsedFused;
   } catch (err) {
     console.warn(`[orchestrator] Response Fusion via Gemini failed: ${err.message}. Trying Nemotron for fusion...`);
     // Fallback: try Nemotron for fusion
     try {
-      const fusedText = await callNemotronNIM(fusionSystem, fusionUser);
-      const parsedFused = JSON.parse(cleanJSONResponse(fusedText));
+      const fusedText = await callNemotronNIM(fusionSystem, fusionUser, "FusionResponses");
+      const parsedFused = parseAIJSON(fusedText, "FusionResponses");
       console.log('[orchestrator] Response Fusion via Nemotron succeeded.');
       return parsedFused;
     } catch (nemErr) {
@@ -603,15 +787,15 @@ Schema:
   const modelTasks = [
     {
       name: "Gemini",
-      call: () => callGeminiDirect(systemPrompt, userPrompt)
+      call: () => callGeminiDirect(systemPrompt, userPrompt, "OrchestratorElicitation")
     },
     {
       name: "MiniMax",
-      call: () => callMiniMaxNIM(systemPrompt, userPrompt)
+      call: () => callMiniMaxNIM(systemPrompt, userPrompt, "OrchestratorValidation")
     },
     {
       name: "Nemotron",
-      call: () => callNemotronNIM(systemPrompt, userPrompt)
+      call: () => callNemotronNIM(systemPrompt, userPrompt, "OrchestratorNemotron")
     }
   ];
 
@@ -627,8 +811,8 @@ Schema:
     let scoreObj = { total: 0, breakdown: { json: 0, schema: 0, density: 0, speed: 0 } };
 
     try {
-      rawOutput = await task.call();
-      parsedData = JSON.parse(cleanJSONResponse(rawOutput));
+      rawOutput = await withTimeout(task.call(), getModelTimeoutMs(), task.name);
+      parsedData = parseAIJSON(rawOutput, task.name);
       const elapsed = Date.now() - start;
       scoreObj = scoreResponse(parsedData, elapsed, task.name);
     } catch (err) {
@@ -719,6 +903,9 @@ module.exports = {
   callNemotronNIM,
   runOrchestratedPipeline,
   scoreResponse,
-  fuseResponses
+  fuseResponses,
+  getGeminiKeyIndex,
+  getMiniMaxKeyIndex,
+  getNemotronKeyIndex,
 };
 

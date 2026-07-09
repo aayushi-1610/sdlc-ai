@@ -11,7 +11,7 @@ for (const model of models) {
     const res = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
       { contents: [{ role: 'user', parts: [{ text: 'Say hello in one word.' }] }] },
-      { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+      { headers: { 'Content-Type': 'application/json' }, timeout: 600000 }
     );
     const text = res.data?.candidates?.[0]?.content?.parts?.[0]?.text;
     console.log(`✅ ${model} -> ${text?.trim()}`);
