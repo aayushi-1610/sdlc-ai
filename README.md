@@ -1,7 +1,7 @@
 # SDLC·AI Platform
 
 > **Requirements In, Architecture Out.**
-> Paste a client brief. Three specialized AI models orchestrate a full Software Requirements Specification, Feasibility Study, Risk Assessment, and ROI — streamed live to your browser in under 2 minutes.
+> Paste a client brief. Three specialized AI models orchestrate a full Software Requirements Specification, Feasibility Study, Risk Assessment, and ROI in the Analysis Phase — then automatically hand off into a Design Phase that produces architecture, database schema, UI/UX, API specs, and security design. All streamed live to your browser in minutes.
 
 ![SDLC·AI Platform](https://img.shields.io/badge/Node.js-v22-green?style=flat-square&logo=node.js) ![Express](https://img.shields.io/badge/Express-v5-black?style=flat-square&logo=express) ![Gemini](https://img.shields.io/badge/Gemini-2.5--flash-blue?style=flat-square&logo=google) ![NVIDIA NIM](https://img.shields.io/badge/NVIDIA-NIM-76b900?style=flat-square&logo=nvidia) ![License](https://img.shields.io/badge/license-ISC-lightgrey?style=flat-square)
 
@@ -9,7 +9,9 @@
 
 ## ✨ What It Does
 
-SDLC·AI automates the **requirements engineering phase** of software development using three AI models running in parallel. Feed it any project brief and it generates:
+SDLC·AI automates the **Analysis** and **Design** phases of software development using three AI models running in parallel. Feed it any project brief and it generates:
+
+### Analysis Phase
 
 | Module | Description |
 |--------|-------------|
@@ -22,6 +24,23 @@ SDLC·AI automates the **requirements engineering phase** of software developmen
 | 🤖 **AI Dashboard** | Per-model performance comparison across 6 dimensions |
 | 📄 **Markdown Report** | Exportable full analysis report |
 
+### Design Phase
+
+| Module | Description |
+|--------|-------------|
+| 🏛️ **High-Level Design** | Architecture style, components & deployment topology |
+| 🗄️ **Database Design** | ER diagram, schema, normalization & sample SQL |
+| 🎨 **UI/UX Design** | Screens, user journeys, design system & accessibility |
+| 🔌 **API Design** | REST endpoints, OpenAPI 3.0 spec & auth flow |
+| 🧩 **Low-Level Design** | Module specs, class/sequence diagrams & pseudocode |
+| 🔐 **Security Design** | Auth architecture, RBAC, encryption & OWASP Top 10 checklist |
+| ⚡ **Performance Design** | Caching, load balancing, auto-scaling & SLA targets |
+| 🚀 **Deployment Design** | Cloud infrastructure, CI/CD pipeline & backup/DR plan |
+| 🧭 **Design Validation** | Requirement-traceability matrix & quality checklist |
+| 🔀 **Design Fusion** | Conflict resolution & final merged deliverables list |
+
+The Design Phase is triggered directly from a completed Analysis session — nothing needs to be re-typed, since the platform already holds full context from the Analysis output.
+
 ---
 
 ## 🤖 AI Models Used
@@ -32,6 +51,8 @@ SDLC·AI automates the **requirements engineering phase** of software developmen
 | **MiniMax-M3 / M2.7** | NVIDIA NIM | Requirements validation, risk prioritization |
 | **Nemotron-3-Super-120B-A12B** | NVIDIA NIM | Tech stack recommendation, feasibility, risk identification, cost estimation |
 
+The same three models are reused across both phases, with each one assigned the sub-tasks that best match its strengths — the Design Phase reuses the Analysis Phase's fusion, validation, and generation roles rather than introducing new models.
+
 ---
 
 ## 🏗️ Architecture
@@ -40,17 +61,21 @@ SDLC·AI automates the **requirements engineering phase** of software developmen
 Browser (HTML + CSS + Vanilla JS)
       │
       │  GET /api/analysis/stream?requirements=...  (Server-Sent Events)
+      │  GET /api/design/stream?sessionId=...        (Server-Sent Events)
       ▼
 Express.js · Node.js · Port 3000
       │
-      ├─ server/routes/analysis.js          ← SSE endpoint
+      ├─ server/routes/analysis.js          ← Analysis SSE endpoint
+      ├─ server/routes/design.js            ← Design SSE endpoint
       └─ server/services/
-           ├─ analysisPipeline.js           ← 10-stage pipeline coordinator
+           ├─ analysisPipeline.js           ← 10-stage Analysis pipeline coordinator
+           ├─ designPipeline.js             ← 10-module Design pipeline coordinator
            ├─ aiService.js                  ← Per-module prompts & mock fallbacks
-           └─ orchestrator.js              ← Multi-model runner & resilience engine
+           ├─ orchestrator.js               ← Multi-model runner & resilience engine
+           └─ sessionStore.js               ← In-memory Analysis→Design handoff (2-hr TTL)
 ```
 
-### 10-Stage Pipeline
+### 10-Stage Analysis Pipeline
 
 ```
 Stage 0  → Parallel Elicitation    (Gemini + MiniMax + Nemotron)
@@ -66,6 +91,23 @@ Stage 9  → AI Dashboard            (System assembly)
 Stage 10 → Markdown Report         (System assembly)
 ```
 
+### 10-Module Design Pipeline
+
+```
+Module 1  → High-Level Design      (Nemotron: architecture style, components, deployment)
+Module 2  → Database Design        (Nemotron: ER diagram, schema, normalization, sample SQL)
+Module 3  → UI/UX Design           (Gemini: screens, user journeys, design system, accessibility)
+Module 4  → API Design             (Gemini: REST endpoints, OpenAPI 3.0 spec, auth flow)
+Module 5  → Low-Level Design       (Nemotron: module specs, class/sequence diagrams, pseudocode)
+Module 6  → Security Design        (MiniMax-M3: auth architecture, RBAC, encryption, OWASP checklist)
+Module 7  → Performance Design     (Nemotron: caching, load balancing, auto-scaling, SLA targets)
+Module 8  → Deployment Design      (Nemotron: cloud infrastructure, CI/CD pipeline, backup/DR)
+Module 9  → Design Validation      (MiniMax-M3: requirement-traceability check, quality checklist)
+Module 10 → Design Fusion          (Gemini: conflict resolution, final merged deliverables list)
+```
+
+The Design Phase begins only after a session token (`sess_<timestamp>_<random>`) is created at the end of the Analysis Phase. All Analysis output is held in memory for a 2-hour window, so clicking **"Generate Design Phase"** carries that full context forward automatically.
+
 ---
 
 ## 🛡️ Resilience Features
@@ -78,6 +120,8 @@ Stage 10 → Markdown Report         (System assembly)
 - **LLM Output Repair Engine** — 8 regex rules fix common malformed JSON from models
 - **Debug File Dumps** — raw model output saved to `*_fail_output.txt` on parse errors
 - **Simulation Mode** — full mock engine for offline development (`USE_MOCK_FALLBACK=true`)
+
+These resilience layers apply uniformly across both the Analysis and Design pipelines, since both route through the same `orchestrator.js` engine.
 
 ---
 
@@ -163,11 +207,14 @@ sdlc-platform/
 ├── server/
 │   ├── index.js                    # Express entry point
 │   ├── routes/
-│   │   └── analysis.js             # SSE streaming route
+│   │   ├── analysis.js             # Analysis SSE streaming route
+│   │   └── design.js               # Design SSE streaming route
 │   └── services/
-│       ├── analysisPipeline.js     # 10-stage pipeline coordinator
+│       ├── analysisPipeline.js     # 10-stage Analysis pipeline coordinator
+│       ├── designPipeline.js       # 10-module Design pipeline coordinator
 │       ├── aiService.js            # AI prompts, schemas, mock fallbacks
-│       └── orchestrator.js         # Multi-model runner & resilience engine
+│       ├── orchestrator.js         # Multi-model runner & resilience engine
+│       └── sessionStore.js         # Analysis→Design session handoff
 ├── public/
 │   ├── index.html                  # Single-page app shell
 │   ├── css/
@@ -186,10 +233,12 @@ sdlc-platform/
 
 ## 💡 Usage Tips
 
-- **Offline / No API keys?** Set `USE_MOCK_FALLBACK=true` in `.env` to use the built-in mock engine with pre-defined food delivery, hospital, and e-commerce scenarios.
+- **Offline / No API keys?** Set `USE_MOCK_FALLBACK=true` in `.env` to use the built-in mock engine with pre-defined food delivery, hospital, and e-commerce scenarios — this covers both the Analysis and Design phases.
 - **Rate limits?** The platform automatically retries and switches providers. Wait 60–90 seconds and try again if Gemini quota is exhausted.
-- **Export results** using the **"⤓ Export Report PDF"** button in the results sidebar.
+- **Export results** using the **"⤓ Export Report PDF"** button in the results sidebar, available after both the Analysis and Design phases complete.
 - **Sample projects** are available via the buttons on the input screen (Food Delivery, Hospital, E-Commerce, Fintech, IoT, Ride-Sharing).
+- **Design Phase requires a completed Analysis session.** Click **"Generate Design Phase"** on the Analysis results screen to carry your session forward — no need to re-paste the brief.
+- **Session window:** Analysis output is held in memory for 2 hours, so the Design Phase must be started within that window.
 
 ---
 
